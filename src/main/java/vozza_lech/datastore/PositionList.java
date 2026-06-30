@@ -25,6 +25,11 @@ public class PositionList {
         m_people.add(new PersonOfInterest(new UpdateTimestamp(), _init_pos));
     }
 
+    // update existing person
+    public void updatePerson(int _index, int _new_pos, UpdateTimestamp _timestamp) {
+        m_people.set(_index, new PersonOfInterest(_timestamp, _new_pos));
+    }
+
     public Optional<UpdateTimestamp> getLastUpdate() {
         if(m_people.isEmpty()) {
             return Optional.empty();

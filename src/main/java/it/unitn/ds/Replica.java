@@ -8,6 +8,8 @@ import vozza_lech.datastore.PersonOfInterest;
 import vozza_lech.datastore.PositionList;
 import vozza_lech.datastore.UpdateLog;
 import vozza_lech.datastore.UpdateTimestamp;
+import vozza_lech.datastore.PendingUpdate;
+import vozza_lech.datastore.Update;
 
 import java.io.Serializable;
 import java.time.Duration;
@@ -55,6 +57,9 @@ public class Replica extends AbstractReplica {
     PositionList           m_position_list;
     UpdateLog              m_updates;
 
+    int m_next_sn = 0;
+    Map<UpdateTimestamp, PendingUpdate> m_pending_updates = new HashMap<>();
+
     //////////////////////////////////////////////////////////////
 
     public static class RunHeartbeat implements Serializable { }
@@ -89,6 +94,38 @@ public class Replica extends AbstractReplica {
 
     public static class HeartbeatReceiveTimeout implements Serializable { }
 
+    // UPDATE message: coordinator to all replicas, carries the write to apply
+    public static class UpdateMsg implements Serializable {
+        public final UpdateTimestamp timestamp;
+        public final Update data;
+
+        public UpdateMsg(UpdateTimestamp _timestamp, Update _data) {
+            timestamp = _timestamp;
+            data = _data;
+        }
+    }
+
+    // ACK message: replica to coordinator, confirms receipt of an UpdateMsg
+    public static class AckMsg implements Serializable {
+        public final UpdateTimestamp timestamp;
+        public final int replicaId;
+
+        public AckMsg(UpdateTimestamp _timestamp, int _replicaId) {
+            timestamp = _timestamp;
+            replicaId = _replicaId;
+        }
+    }
+
+    // WRITEOK message: coordinator to all replicas, confirms quorum reached, apply now
+    public static class WriteOkMsg implements Serializable {
+        public final UpdateTimestamp timestamp;
+        public final Update data;
+
+        public WriteOkMsg(UpdateTimestamp _timestamp, Update _data) {
+            timestamp = _timestamp;
+            data = _data;
+        }
+    }
     //////////////////////////////////////////////////////////////
 
 
@@ -104,9 +141,116 @@ public class Replica extends AbstractReplica {
         m_crash_request     = Optional.empty();
         m_position_list     = new PositionList();
         m_updates           = new UpdateLog();
+        m_next_sn = 0;
+        m_pending_updates = new HashMap<>();
         m_pending_heartbeat = Optional.empty();
         m_heartbeat_timeouts     = new HashMap<>();
         m_recv_heartbeat_timeout = Optional.empty();
+    }
+
+    public void onWriteRequest(AbstractClient.WriteRequest _request) {
+        if (Status.CRASHED == m_curr_status) {
+            return;
+        }
+
+        if (id == m_curr_epoch.coordinator_id) {
+            // We are the coordinator, start the two-phase broadcast ourselves.
+            var data = new Update(_request.index, _request.value);
+            var timestamp = new UpdateTimestamp(m_curr_epoch.id, m_next_sn);
+            m_next_sn++;
+
+            var pending = new PendingUpdate(data, timestamp, getSender(), id);
+            m_pending_updates.put(timestamp, pending);
+
+            debug(String.format("broadcasting UPDATE %d:%d (%d, %d)",
+                    timestamp.getEpoch(), timestamp.getSn(), _request.index, _request.value));
+
+            m_curr_epoch.active_replicas.forEach((_id, _ref) -> {
+                if (_id == id) {
+                    return; // don't send the message to ourselves
+                }
+                tell(new UpdateMsg(timestamp, data), _ref);
+            });
+        } else {
+            // Not the coordinator: just forward the request along.
+            var coordinator_ref = m_curr_epoch.active_replicas.get(m_curr_epoch.coordinator_id);
+            tell(_request, coordinator_ref);
+            // TODO (later, with crash handling): start a timeout here to detect a C that never initiates the broadcast.
+        }
+    }
+
+    public void onUpdateMsg(UpdateMsg _msg) {
+        if (Status.CRASHED == m_curr_status) {
+            return;
+        }
+
+        debug(String.format("received UPDATE %d:%d (%d, %d)",
+                _msg.timestamp.getEpoch(), _msg.timestamp.getSn(),
+                _msg.data.getIndex(), _msg.data.getPosition()));
+
+        // Just ACK; update applied upon WRITEOK.
+        tell(new AckMsg(_msg.timestamp, id), getSender());
+
+        // TODO (later, with crash handling): start a timeout here to detect a C that never sends WRITEOK after this UPDATE.
+    }
+
+    public void onAckMsg(AckMsg _msg) {
+        if (Status.CRASHED == m_curr_status) {
+            return;
+        }
+
+        var pending = m_pending_updates.get(_msg.timestamp);
+        if (pending == null) {
+            // Already completed or stale ack, nothing to do
+            debug(String.format("received late/duplicate ACK for %d:%d from %d",
+                    _msg.timestamp.getEpoch(), _msg.timestamp.getSn(), _msg.replicaId));
+            return;
+        }
+
+        pending.addAck(_msg.replicaId);
+
+        int quorumSize = (getSystemNumberOfActors() / 2) + 1;
+        if (pending.hasQuorum(quorumSize)) {
+            m_pending_updates.remove(_msg.timestamp);
+            m_updates.addLog(pending.getData(), pending.getTimestamp());
+
+            debug(String.format("quorum reached for %d:%d, broadcasting WRITEOK",
+                    _msg.timestamp.getEpoch(), _msg.timestamp.getSn()));
+
+            m_curr_epoch.active_replicas.forEach((_id, _ref) -> {
+                if (_id == id) {
+                    return;
+                }
+                tell(new WriteOkMsg(pending.getTimestamp(), pending.getData()), _ref);
+            });
+
+            // Apply locally too (coordinator is also a replica) and reply to client
+            applyUpdate(pending.getData(), pending.getTimestamp());
+
+            var result = new AbstractClient.WriteResult(true,
+                    pending.getData().getIndex(), pending.getData().getPosition(), id);
+            pending.getClient().tell(result, getSelf());
+        }
+    }
+
+    public void onWriteOkMsg(WriteOkMsg _msg) {
+        if (Status.CRASHED == m_curr_status) {
+            return;
+        }
+
+        debug(String.format("received WRITEOK %d:%d (%d, %d)",
+                _msg.timestamp.getEpoch(), _msg.timestamp.getSn(),
+                _msg.data.getIndex(), _msg.data.getPosition()));
+
+        m_updates.addLog(_msg.data, _msg.timestamp);
+        applyUpdate(_msg.data, _msg.timestamp);
+    }
+
+    private void applyUpdate(Update _data, UpdateTimestamp _timestamp) {
+        m_position_list.updatePerson(_data.getIndex(), _data.getPosition(), _timestamp);
+        callbackOnUpdateApplied(_data.getIndex(), _data.getPosition());
+        log(String.format("applied update %d:%d (%d, %d)",
+                _timestamp.getEpoch(), _timestamp.getSn(), _data.getIndex(), _data.getPosition()));
     }
 
     public static Props props(int id, int minLatency, int maxLatency, int coordinatorBeatInterval) {
@@ -340,6 +484,10 @@ public class Replica extends AbstractReplica {
     public final Receive createReceive() {
         return createBaseReceiveBuilder()
                 .match(AbstractClient.ReadRequest.class, this::onReadRequest)
+                .match(AbstractClient.WriteRequest.class, this::onWriteRequest)
+                .match(UpdateMsg.class, this::onUpdateMsg)
+                .match(AckMsg.class, this::onAckMsg)
+                .match(WriteOkMsg.class, this::onWriteOkMsg)
                 .match(RunHeartbeat.class, this::onRunHeartbeat)
                 .match(HeartbeatRequestTimeout.class, this::onHeartbeatRequestTimeout)
                 .match(HeartbeatResponse.class, this::onHeartbeatResponse)
