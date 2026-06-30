@@ -12,7 +12,7 @@ public class PositionList {
     }
 
     public Optional<PersonOfInterest> getPerson(int _index) {
-        if(m_people.isEmpty()) {
+        if(m_people.isEmpty() || m_people.size() < _index) {
             return Optional.empty();
         }
 

@@ -1,11 +1,97 @@
 package it.unitn.ds;
 
 import akka.actor.ActorRef;
+import akka.actor.Cancellable;
+import akka.actor.IllegalActorStateException;
 import akka.actor.Props;
+import vozza_lech.datastore.PersonOfInterest;
+import vozza_lech.datastore.PositionList;
+import vozza_lech.datastore.UpdateLog;
+import vozza_lech.datastore.UpdateTimestamp;
 
+import java.io.Serializable;
+import java.time.Duration;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Optional;
 
 public class Replica extends AbstractReplica {
+
+    //////////////////////////////////////////////////////////////
+
+    public static class Epoch {
+        public int                    id;
+        /// Local map of active replicas.
+        /// Only useful to avoid sending messages to them
+        public Map<Integer, ActorRef> active_replicas;
+        public int                    coordinator_id;
+    }
+
+    private enum Status {
+        STARTED,
+        IDLE,
+        CRASHED,
+        ELECTION
+    }
+
+    private static class CrashRequest {
+        public Crash crash;
+        public int   curr_message_count;
+    }
+
+    Epoch                  m_curr_epoch;
+    Status                 m_curr_status;
+    /// Possibly pending crash request if it has delayed effect
+    Optional<CrashRequest> m_crash_request;
+
+    /// Periodic event used to then send heartbeats and schedule timeouts
+    Optional<Cancellable>         m_pending_heartbeat;
+    /// Timeout events for sent heartbeats and their replica
+    HashMap<Integer, Cancellable> m_heartbeat_timeouts;
+
+    /// Timeout event used to detect silent coordinator failures
+    Optional<Cancellable>         m_recv_heartbeat_timeout;
+
+    PositionList           m_position_list;
+    UpdateLog              m_updates;
+
+    //////////////////////////////////////////////////////////////
+
+    public static class RunHeartbeat implements Serializable { }
+
+    public static class HeartbeatRequest implements Serializable {
+        public ActorRef coordinator;
+
+        public HeartbeatRequest(ActorRef _coord) {
+            coordinator = _coord;
+        }
+    }
+
+    public static class HeartbeatResponse implements Serializable {
+        public ActorRef replica;
+        public int      replica_id;
+
+        public HeartbeatResponse(ActorRef _replica, int _replica_id) {
+            replica    = _replica;
+            replica_id = _replica_id;
+        }
+    }
+
+    public static class HeartbeatRequestTimeout implements Serializable {
+        public ActorRef replica;
+        public int      replica_id;
+
+        public HeartbeatRequestTimeout(ActorRef _replica, int _replica_id) {
+            replica    = _replica;
+            replica_id = _replica_id;
+        }
+    }
+
+    public static class HeartbeatReceiveTimeout implements Serializable { }
+
+    //////////////////////////////////////////////////////////////
+
+
 
     public Replica(int id) {
         this(id, AbstractReplica.MIN_LATENCY, AbstractReplica.MAX_LATENCY, AbstractReplica.COORDINATOR_BEAT_INTERVAL, Optional.empty());
@@ -13,7 +99,14 @@ public class Replica extends AbstractReplica {
 
     public Replica(int id, int minLatency, int maxLatency, int coordinatorBeatInterval, Optional<ActorRef> listener) {
         super(id, minLatency, maxLatency, coordinatorBeatInterval, listener);
-        // TODO: implement
+        m_curr_epoch        = new Epoch();
+        m_curr_status       = Status.STARTED;
+        m_crash_request     = Optional.empty();
+        m_position_list     = new PositionList();
+        m_updates           = new UpdateLog();
+        m_pending_heartbeat = Optional.empty();
+        m_heartbeat_timeouts     = new HashMap<>();
+        m_recv_heartbeat_timeout = Optional.empty();
     }
 
     public static Props props(int id, int minLatency, int maxLatency, int coordinatorBeatInterval) {
@@ -25,26 +118,233 @@ public class Replica extends AbstractReplica {
         return Props.create(Replica.class, () -> new Replica(id, minLatency, maxLatency, coordinatorBeatInterval, Optional.ofNullable(listener)));
     }
 
+    /**
+     * Called when a crash truly takes effect
+     */
+    public void onCrashInEffect() {
+        // Cancel all events and mark this
+        // replica as crashed
+        m_curr_status = Status.CRASHED;
+        m_pending_heartbeat.ifPresent(Cancellable::cancel);
+        m_pending_heartbeat = Optional.empty();
+        m_heartbeat_timeouts.forEach((_i, _cancel) -> _cancel.cancel());
+        m_heartbeat_timeouts.clear();
+        m_crash_request = Optional.empty();
+        m_recv_heartbeat_timeout.ifPresent(Cancellable::cancel);
+        m_recv_heartbeat_timeout = Optional.empty();
+    }
+
     @Override
     public int getSystemNumberOfActors() {
-        // TODO: implement
-        return 0;
+        // TODO: Change this
+        return m_curr_epoch.active_replicas.size();
     }
 
     @Override
     public void crash(AbstractReplica.Crash how_to_crash) {
-        // TODO: implement
+        if (Status.CRASHED == m_curr_status) {
+            debug(String.format("CRASH requested for replica %d, but already crashed", id));
+            return;
+        }
+
+        // TODO: Verify this is ok
+        if(m_crash_request.isPresent()) {
+            throw new IllegalActorStateException("Crash requested even though a crash request already exists");
+        }
+
+        // Crash immediately
+        if(Crash.Type.Now == how_to_crash.type) {
+            onCrashInEffect();
+            return;
+        }
+
+        // Schedule crash in the future
+        var crash_req = new CrashRequest();
+        crash_req.crash = new Crash(how_to_crash.type, how_to_crash.after_n_messages_of_type);
+        crash_req.curr_message_count = 0;
+        m_crash_request = Optional.of( crash_req );
     }
 
     @Override
     public void initSystem(InitSystem sysInit) {
-        // TODO: implement
+        /// It should not be possible for the
+        /// replica to be crashed here
+        m_curr_epoch.active_replicas = Map.copyOf(sysInit.group);
+        m_curr_epoch.id              = 0;
+        m_curr_epoch.coordinator_id  = sysInit.coordinator_id;
+        m_curr_status = Status.IDLE;
+
+        for(var person_id = 0; person_id < POSITIONS_LIST_LENGTH; person_id++) {
+            m_position_list.addPerson(0);
+        }
+
+        if(id == m_curr_epoch.coordinator_id) {
+            // Schedule periodic heartbeat events
+             m_pending_heartbeat = Optional.of( getContext().getSystem()
+                    .getScheduler()
+                    .scheduleAtFixedRate(
+                            Duration.ofMillis(getCoordinatorBeatInterval()),
+                            Duration.ofMillis(getCoordinatorBeatInterval()),
+                            getSelf(),
+                            new RunHeartbeat(),
+                            getContext().getDispatcher(),
+                            getSelf()
+                    )
+             );
+        } else {
+            // Schedule timeout for heartbeat
+            m_recv_heartbeat_timeout = Optional.of(
+                    getContext().getSystem()
+                            .getScheduler()
+                            .scheduleOnce(
+                                    Duration.ofMillis(getCoordinatorBeatInterval() * 2L),
+                                    getSelf(),
+                                    new HeartbeatReceiveTimeout(),
+                                    getContext().getDispatcher(),
+                                    getSelf()
+                            )
+            );
+        }
+    }
+
+    public void onReadRequest(AbstractClient.ReadRequest _request) {
+        if(Status.CRASHED == m_curr_status) {
+            return;
+        }
+
+        var maybe_person = m_position_list.getPerson(_request.index);
+        var result = new AbstractClient.ReadResult(maybe_person.isPresent(), _request.index,
+                maybe_person.orElse(new PersonOfInterest(new UpdateTimestamp(), 0)).position,
+                id);
+
+        getSender().tell(result, getSelf());
+    }
+
+    public void onRunHeartbeat(RunHeartbeat _beat) {
+        if(m_curr_epoch.coordinator_id != id) {
+            // Uhm... what?
+            throw new IllegalActorStateException("Running heartbeat on non-coordinator replica");
+        }
+
+        // Check if we should crash before sending heartbeats
+        if(m_crash_request.isPresent() && Crash.Type.Heartbeat == m_crash_request.get().crash.type) {
+            var crash_internal = m_crash_request.get();
+            crash_internal.curr_message_count++;
+            if(crash_internal.curr_message_count >= crash_internal.crash.after_n_messages_of_type) {
+                onCrashInEffect();
+                return;
+            }
+        }
+
+        debug(String.format("running HEARTBEAT from %d", id));
+
+        m_curr_epoch
+                .active_replicas
+                .forEach((_id, _ref) -> {
+                    // Do not send to self
+                    if(_id == id) {
+                        return;
+                    }
+                    // Send heartbeat and schedule timeout
+                    _ref.tell(new HeartbeatRequest(getSelf()), getSelf());
+                    m_heartbeat_timeouts.put(_id,
+                            getContext().getSystem()
+                                    .getScheduler()
+                                    .scheduleOnce(
+                                            Duration.ofMillis(getMaxLatency() * 2L),
+                                            getSelf(),
+                                            new HeartbeatRequestTimeout(_ref, _id),
+                                            getContext().getDispatcher(),
+                                            getSelf()
+                                    )
+                            );
+                });
+    }
+
+    public void onHeartbeatRequestTimeout(HeartbeatRequestTimeout _timeout) {
+        if(m_curr_epoch.coordinator_id != id) {
+            throw new IllegalActorStateException("Received heartbeat timeout not on coordinator");
+        }
+
+        debug(String.format("TIMEOUT for heartbeat to %d", _timeout.replica_id));
+        // Remove timeout event from the map
+        // and locally mark the replica as dead
+        m_heartbeat_timeouts.remove(_timeout.replica_id);
+        m_curr_epoch.active_replicas.remove(_timeout.replica_id);
+    }
+
+    public void onHeartbeatResponse(HeartbeatResponse _response) {
+        if(Status.CRASHED == m_curr_status) {
+            return;
+        }
+
+        if(m_curr_epoch.coordinator_id != id) {
+            throw new IllegalActorStateException("Received heartbeat response not on coordinator");
+        }
+
+        if(!m_heartbeat_timeouts.containsKey(_response.replica_id)) {
+            debug(String.format("received late heartbeat RESPONSE from %d", _response.replica_id));
+            // TODO: Should we reinsert the replica in the active list?
+            return;
+        }
+
+        debug(String.format("heartbeat RESPONSE from %d", _response.replica_id));
+        // Remove timeout event
+        m_heartbeat_timeouts.get(_response.replica_id).cancel();
+        m_heartbeat_timeouts.remove(_response.replica_id);
+    }
+
+    public void onHeartbeatRequest(HeartbeatRequest _request) {
+        if(Status.CRASHED == m_curr_status || Status.ELECTION == m_curr_status) {
+            return;
+        }
+
+        if(m_curr_epoch.coordinator_id == id) {
+            return;
+        }
+
+        var response = new HeartbeatResponse(getSelf(), id);
+        getSender().tell(response, getSelf());
+
+        // Remove coordinator crash failure detection and put
+        // a renewed one in its place
+        m_recv_heartbeat_timeout.ifPresent(Cancellable::cancel);
+        m_recv_heartbeat_timeout = Optional.of(
+                getContext().getSystem()
+                        .getScheduler()
+                        .scheduleOnce(
+                                Duration.ofMillis(getCoordinatorBeatInterval() * 2L),
+                                getSelf(),
+                                new HeartbeatReceiveTimeout(),
+                                getContext().getDispatcher(),
+                                getSelf()
+                        )
+        );
+
+
+        // Verify if we should crash
+        if(m_crash_request.isPresent() && Crash.Type.Heartbeat == m_crash_request.get().crash.type) {
+            var crash_internal = m_crash_request.get();
+            crash_internal.curr_message_count++;
+            if(crash_internal.curr_message_count >= crash_internal.crash.after_n_messages_of_type) {
+                onCrashInEffect();
+            }
+        }
+    }
+
+    public void onHeartbeatReceiveTimeout(HeartbeatReceiveTimeout _timeout) {
+        /// Coordinator silently crashed, run election algorithm
     }
 
     @Override
     public final Receive createReceive() {
         return createBaseReceiveBuilder()
-                // TODO add your message handlers here .match(, )
+                .match(AbstractClient.ReadRequest.class, this::onReadRequest)
+                .match(RunHeartbeat.class, this::onRunHeartbeat)
+                .match(HeartbeatRequestTimeout.class, this::onHeartbeatRequestTimeout)
+                .match(HeartbeatResponse.class, this::onHeartbeatResponse)
+                .match(HeartbeatRequest.class, this::onHeartbeatRequest)
+                .match(HeartbeatReceiveTimeout.class, this::onHeartbeatReceiveTimeout)
                 .build();
     }
 

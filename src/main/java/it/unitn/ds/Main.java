@@ -14,7 +14,7 @@ public class Main {
         System.out.println("START");
         System.out.println("========================================\n");
 
-        final int N_REPLICAS = 4;
+        final int N_REPLICAS = 3;
         final int COORDINATOR_ID = 0;
         final ActorSystem system = ActorSystem.create("TestMain");
 
@@ -39,6 +39,9 @@ public class Main {
         // TODO: Create your clients
         
         // TODO: Implement your main logic
+        try {
+            Thread.sleep(20000L);
+        } catch (InterruptedException ignored) {}
 
         system.terminate();
 
