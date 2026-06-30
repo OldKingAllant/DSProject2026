@@ -35,6 +35,18 @@ public class UpdateTimestamp implements Serializable, Comparable<UpdateTimestamp
     }
 
     @Override
+    public boolean equals(Object obj) {
+        if (this == obj) {
+            return true;
+        }
+        if (!(obj instanceof UpdateTimestamp)) {
+            return false;
+        }
+        UpdateTimestamp other = (UpdateTimestamp) obj;
+        return this.m_epoch == other.m_epoch && this.m_sn == other.m_sn;
+    }
+
+    @Override
     public int compareTo(UpdateTimestamp o) {
         if(this.m_epoch == o.m_epoch) {
             return Integer.compare(this.m_sn, o.m_sn);
