@@ -42,7 +42,7 @@ public class Replica extends AbstractReplica {
     }
 
     // Pairs a write request with the client that sent it
-    private static class QueuedWrite {
+    public static class QueuedWrite {
         public final AbstractClient.WriteRequest request;
         public final ActorRef client;
 
@@ -175,11 +175,33 @@ public class Replica extends AbstractReplica {
             // Enqueue and try to start broadcast (starts immediately if nothing in flight)
             m_write_queue.add(new QueuedWrite(_request, getSender()));
             tryStartNextBroadcast();
+
+            if(m_crash_request.isPresent() && Crash.Type.Update == m_crash_request.get().crash.type) {
+                onCrashInEffect();
+            }
         } else {
             // Not the coordinator: just forward the request along.
             var coordinator_ref = m_curr_epoch.active_replicas.get(m_curr_epoch.coordinator_id);
-            tell(_request, coordinator_ref);
+            var queued_write = new QueuedWrite(_request, getSender());
+            coordinator_ref.tell(queued_write, getSelf());
             // TODO (later, with crash handling): start a timeout here to detect a C that never initiates the broadcast.
+        }
+    }
+
+    public void onQueuedWrite(QueuedWrite _write) {
+        if(Status.CRASHED == m_curr_status) {
+            return;
+        }
+
+        if(id != m_curr_epoch.coordinator_id) {
+            throw new IllegalActorStateException("Non-coordinator received queue write");
+        }
+
+        m_write_queue.add(_write);
+        tryStartNextBroadcast();
+
+        if(m_crash_request.isPresent() && Crash.Type.Update == m_crash_request.get().crash.type) {
+            onCrashInEffect();
         }
     }
 
@@ -219,6 +241,11 @@ public class Replica extends AbstractReplica {
 
         // Just ACK; update applied upon WRITEOK.
         tell(new AckMsg(_msg.timestamp, id), getSender());
+
+        // Crash replica if crash type is after update
+        if(m_crash_request.isPresent() && Crash.Type.Update == m_crash_request.get().crash.type) {
+            onCrashInEffect();
+        }
 
         // TODO (later, with crash handling): start a timeout here to detect a C that never sends WRITEOK after this UPDATE.
     }
@@ -515,11 +542,16 @@ public class Replica extends AbstractReplica {
         /// Coordinator silently crashed, run election algorithm
     }
 
+    public void onWriteResult(AbstractClient.WriteResult _result) {
+        debug(String.format("replica %d received write RESULT", id));
+    }
+
     @Override
     public final Receive createReceive() {
         return createBaseReceiveBuilder()
                 .match(AbstractClient.ReadRequest.class, this::onReadRequest)
                 .match(AbstractClient.WriteRequest.class, this::onWriteRequest)
+                .match(QueuedWrite.class, this::onQueuedWrite)
                 .match(UpdateMsg.class, this::onUpdateMsg)
                 .match(AckMsg.class, this::onAckMsg)
                 .match(WriteOkMsg.class, this::onWriteOkMsg)

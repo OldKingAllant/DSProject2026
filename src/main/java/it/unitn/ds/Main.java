@@ -90,6 +90,8 @@ public class Main {
             client2.tell(new AbstractClient.ReadRequest(2), ActorRef.noSender());
             Thread.sleep(500);
 
+            Thread.sleep(2000L);
+
         } catch (InterruptedException ignored) {}
 
         system.terminate();
