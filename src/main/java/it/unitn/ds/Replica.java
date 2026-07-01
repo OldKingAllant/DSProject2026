@@ -68,8 +68,8 @@ public class Replica extends AbstractReplica {
     PositionList           m_position_list;
     UpdateLog              m_updates;
 
-    int m_next_sn = 0;
-    Map<UpdateTimestamp, PendingUpdate> m_pending_updates = new HashMap<>();
+    int m_next_sn;
+    Map<UpdateTimestamp, PendingUpdate> m_pending_updates;
 
     // Queue of write requests waiting to be broadcast.
     // The coordinator processes only one update at a time to preserve total order:
@@ -542,9 +542,9 @@ public class Replica extends AbstractReplica {
         /// Coordinator silently crashed, run election algorithm
     }
 
-    public void onWriteResult(AbstractClient.WriteResult _result) {
-        debug(String.format("replica %d received write RESULT", id));
-    }
+    // public void onWriteResult(AbstractClient.WriteResult _result) {
+    //     debug(String.format("replica %d received write RESULT", id));
+    // }
 
     @Override
     public final Receive createReceive() {
