@@ -41,6 +41,17 @@ public class Replica extends AbstractReplica {
         public int   curr_message_count;
     }
 
+    // Pairs a write request with the client that sent it
+    private static class QueuedWrite {
+        public final AbstractClient.WriteRequest request;
+        public final ActorRef client;
+
+        public QueuedWrite(AbstractClient.WriteRequest _request, ActorRef _client) {
+            request = _request;
+            client = _client;
+        }
+    }
+
     Epoch                  m_curr_epoch;
     Status                 m_curr_status;
     /// Possibly pending crash request if it has delayed effect
@@ -63,7 +74,7 @@ public class Replica extends AbstractReplica {
     // Queue of write requests waiting to be broadcast.
     // The coordinator processes only one update at a time to preserve total order:
     // the next request is dequeued only after WRITEOK for the current one is sent.
-    java.util.Queue<AbstractClient.WriteRequest> m_write_queue = new java.util.LinkedList<>();
+    java.util.Queue<QueuedWrite> m_write_queue = new java.util.LinkedList<>();
 
     boolean m_broadcast_in_progress = false;
 
@@ -162,7 +173,7 @@ public class Replica extends AbstractReplica {
 
         if (id == m_curr_epoch.coordinator_id) {
             // Enqueue and try to start broadcast (starts immediately if nothing in flight)
-            m_write_queue.add(_request);
+            m_write_queue.add(new QueuedWrite(_request, getSender()));
             tryStartNextBroadcast();
         } else {
             // Not the coordinator: just forward the request along.
@@ -178,18 +189,18 @@ public class Replica extends AbstractReplica {
             return;
         }
 
-        var _request = m_write_queue.poll();
+        var queuedWrite = m_write_queue.poll();
         m_broadcast_in_progress = true;
 
-        var data = new Update(_request.index, _request.value);
+        var data = new Update(queuedWrite.request.index, queuedWrite.request.value);
         var timestamp = new UpdateTimestamp(m_curr_epoch.id, m_next_sn);
         m_next_sn++;
 
-        var pending = new PendingUpdate(data, timestamp, getSender(), id);
+        var pending = new PendingUpdate(data, timestamp, queuedWrite.client, id);
         m_pending_updates.put(timestamp, pending);
 
         debug(String.format("broadcasting UPDATE %d:%d (%d, %d)",
-                timestamp.getEpoch(), timestamp.getSn(), _request.index, _request.value));
+                timestamp.getEpoch(), timestamp.getSn(), queuedWrite.request.index, queuedWrite.request.value));
 
         m_curr_epoch.active_replicas.forEach((_id, _ref) -> {
             if (_id == id) return;
