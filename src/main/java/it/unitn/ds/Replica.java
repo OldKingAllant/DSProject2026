@@ -60,6 +60,13 @@ public class Replica extends AbstractReplica {
     int m_next_sn = 0;
     Map<UpdateTimestamp, PendingUpdate> m_pending_updates = new HashMap<>();
 
+    // Queue of write requests waiting to be broadcast.
+    // The coordinator processes only one update at a time to preserve total order:
+    // the next request is dequeued only after WRITEOK for the current one is sent.
+    java.util.Queue<AbstractClient.WriteRequest> m_write_queue = new java.util.LinkedList<>();
+
+    boolean m_broadcast_in_progress = false;
+
     //////////////////////////////////////////////////////////////
 
     public static class RunHeartbeat implements Serializable { }
@@ -154,29 +161,40 @@ public class Replica extends AbstractReplica {
         }
 
         if (id == m_curr_epoch.coordinator_id) {
-            // We are the coordinator, start the two-phase broadcast ourselves.
-            var data = new Update(_request.index, _request.value);
-            var timestamp = new UpdateTimestamp(m_curr_epoch.id, m_next_sn);
-            m_next_sn++;
-
-            var pending = new PendingUpdate(data, timestamp, getSender(), id);
-            m_pending_updates.put(timestamp, pending);
-
-            debug(String.format("broadcasting UPDATE %d:%d (%d, %d)",
-                    timestamp.getEpoch(), timestamp.getSn(), _request.index, _request.value));
-
-            m_curr_epoch.active_replicas.forEach((_id, _ref) -> {
-                if (_id == id) {
-                    return; // don't send the message to ourselves
-                }
-                tell(new UpdateMsg(timestamp, data), _ref);
-            });
+            // Enqueue and try to start broadcast (starts immediately if nothing in flight)
+            m_write_queue.add(_request);
+            tryStartNextBroadcast();
         } else {
             // Not the coordinator: just forward the request along.
             var coordinator_ref = m_curr_epoch.active_replicas.get(m_curr_epoch.coordinator_id);
             tell(_request, coordinator_ref);
             // TODO (later, with crash handling): start a timeout here to detect a C that never initiates the broadcast.
         }
+    }
+
+    private void tryStartNextBroadcast() {
+        // Only start a new broadcast if nothing is currently in flight
+        if (m_broadcast_in_progress || m_write_queue.isEmpty()) {
+            return;
+        }
+
+        var _request = m_write_queue.poll();
+        m_broadcast_in_progress = true;
+
+        var data = new Update(_request.index, _request.value);
+        var timestamp = new UpdateTimestamp(m_curr_epoch.id, m_next_sn);
+        m_next_sn++;
+
+        var pending = new PendingUpdate(data, timestamp, getSender(), id);
+        m_pending_updates.put(timestamp, pending);
+
+        debug(String.format("broadcasting UPDATE %d:%d (%d, %d)",
+                timestamp.getEpoch(), timestamp.getSn(), _request.index, _request.value));
+
+        m_curr_epoch.active_replicas.forEach((_id, _ref) -> {
+            if (_id == id) return;
+            tell(new UpdateMsg(timestamp, data), _ref);
+        });
     }
 
     public void onUpdateMsg(UpdateMsg _msg) {
@@ -226,6 +244,9 @@ public class Replica extends AbstractReplica {
 
             // Apply locally too (coordinator is also a replica) and reply to client
             applyUpdate(pending.getData(), pending.getTimestamp());
+
+            m_broadcast_in_progress = false;
+            tryStartNextBroadcast(); // start next write if any are queued
 
             var result = new AbstractClient.WriteResult(true,
                     pending.getData().getIndex(), pending.getData().getPosition(), id);
@@ -313,7 +334,10 @@ public class Replica extends AbstractReplica {
     public void initSystem(InitSystem sysInit) {
         /// It should not be possible for the
         /// replica to be crashed here
-        m_curr_epoch.active_replicas = Map.copyOf(sysInit.group);
+        //TODO check that this is ok
+        //m_curr_epoch.active_replicas = Map.copyOf(sysInit.group);
+        m_curr_epoch.active_replicas = new HashMap<>(sysInit.group);
+
         m_curr_epoch.id              = 0;
         m_curr_epoch.coordinator_id  = sysInit.coordinator_id;
         m_curr_status = Status.IDLE;
