@@ -71,6 +71,9 @@ public class Replica extends AbstractReplica {
     int m_next_sn;
     Map<UpdateTimestamp, PendingUpdate> m_pending_updates;
 
+    Optional<Cancellable>               m_broadcast_timeout;
+    Optional<Cancellable>               m_writeok_timeout;
+
     // Queue of write requests waiting to be broadcast.
     // The coordinator processes only one update at a time to preserve total order:
     // the next request is dequeued only after WRITEOK for the current one is sent.
@@ -144,6 +147,9 @@ public class Replica extends AbstractReplica {
             data = _data;
         }
     }
+
+    public static class BroadcastTimeout implements Serializable {}
+    public static class WriteOKTimeout implements Serializable {}
     //////////////////////////////////////////////////////////////
 
 
@@ -164,6 +170,8 @@ public class Replica extends AbstractReplica {
         m_pending_heartbeat = Optional.empty();
         m_heartbeat_timeouts     = new HashMap<>();
         m_recv_heartbeat_timeout = Optional.empty();
+        m_broadcast_timeout = Optional.empty();
+        m_writeok_timeout   = Optional.empty();
     }
 
     public void onWriteRequest(AbstractClient.WriteRequest _request) {
@@ -185,6 +193,17 @@ public class Replica extends AbstractReplica {
             var queued_write = new QueuedWrite(_request, getSender());
             coordinator_ref.tell(queued_write, getSelf());
             // TODO (later, with crash handling): start a timeout here to detect a C that never initiates the broadcast.
+            m_broadcast_timeout = Optional.of(
+                    getContext().getSystem()
+                            .getScheduler()
+                            .scheduleOnce(
+                                    Duration.ofMillis(getMaxLatencyPlusTolerance()),
+                                    getSelf(),
+                                    new BroadcastTimeout(),
+                                    getContext().getDispatcher(),
+                                    getSelf()
+                            )
+            );
         }
     }
 
@@ -201,7 +220,11 @@ public class Replica extends AbstractReplica {
         tryStartNextBroadcast();
 
         if(m_crash_request.isPresent() && Crash.Type.Update == m_crash_request.get().crash.type) {
-            onCrashInEffect();
+            var crash_internal = m_crash_request.get();
+            crash_internal.curr_message_count++;
+            if(crash_internal.curr_message_count >= crash_internal.crash.after_n_messages_of_type) {
+                onCrashInEffect();
+            }
         }
     }
 
@@ -235,6 +258,9 @@ public class Replica extends AbstractReplica {
             return;
         }
 
+        m_broadcast_timeout.ifPresent(Cancellable::cancel);
+        m_broadcast_timeout = Optional.empty();
+
         debug(String.format("received UPDATE %d:%d (%d, %d)",
                 _msg.timestamp.getEpoch(), _msg.timestamp.getSn(),
                 _msg.data.getIndex(), _msg.data.getPosition()));
@@ -244,10 +270,26 @@ public class Replica extends AbstractReplica {
 
         // Crash replica if crash type is after update
         if(m_crash_request.isPresent() && Crash.Type.Update == m_crash_request.get().crash.type) {
-            onCrashInEffect();
+            var crash_internal = m_crash_request.get();
+            crash_internal.curr_message_count++;
+            if(crash_internal.curr_message_count >= crash_internal.crash.after_n_messages_of_type) {
+                onCrashInEffect();
+                return;
+            }
         }
 
         // TODO (later, with crash handling): start a timeout here to detect a C that never sends WRITEOK after this UPDATE.
+        m_writeok_timeout = Optional.of(
+          getContext().getSystem()
+                  .getScheduler()
+                  .scheduleOnce(
+                          Duration.ofMillis(getMaxLatencyPlusTolerance()),
+                          getSelf(),
+                          new WriteOKTimeout(),
+                          getContext().getDispatcher(),
+                          getSelf()
+                  )
+        );
     }
 
     public void onAckMsg(AckMsg _msg) {
@@ -297,12 +339,23 @@ public class Replica extends AbstractReplica {
             return;
         }
 
+        m_writeok_timeout.ifPresent(Cancellable::cancel);
+        m_writeok_timeout = Optional.empty();
+
         debug(String.format("received WRITEOK %d:%d (%d, %d)",
                 _msg.timestamp.getEpoch(), _msg.timestamp.getSn(),
                 _msg.data.getIndex(), _msg.data.getPosition()));
 
         m_updates.addLog(_msg.data, _msg.timestamp);
         applyUpdate(_msg.data, _msg.timestamp);
+    }
+
+    public void onBroadcastTimeout(BroadcastTimeout _timeout) {
+        //
+    }
+
+    public void onWriteOKTimeout(WriteOKTimeout _timeout) {
+        //
     }
 
     private void applyUpdate(Update _data, UpdateTimestamp _timestamp) {
@@ -335,6 +388,10 @@ public class Replica extends AbstractReplica {
         m_crash_request = Optional.empty();
         m_recv_heartbeat_timeout.ifPresent(Cancellable::cancel);
         m_recv_heartbeat_timeout = Optional.empty();
+        m_broadcast_timeout.ifPresent(Cancellable::cancel);
+        m_broadcast_timeout = Optional.empty();
+        m_writeok_timeout.ifPresent(Cancellable::cancel);
+        m_writeok_timeout = Optional.empty();
     }
 
     @Override
@@ -555,6 +612,8 @@ public class Replica extends AbstractReplica {
                 .match(UpdateMsg.class, this::onUpdateMsg)
                 .match(AckMsg.class, this::onAckMsg)
                 .match(WriteOkMsg.class, this::onWriteOkMsg)
+                .match(BroadcastTimeout.class, this::onBroadcastTimeout)
+                .match(WriteOKTimeout.class, this::onWriteOKTimeout)
                 .match(RunHeartbeat.class, this::onRunHeartbeat)
                 .match(HeartbeatRequestTimeout.class, this::onHeartbeatRequestTimeout)
                 .match(HeartbeatResponse.class, this::onHeartbeatResponse)
