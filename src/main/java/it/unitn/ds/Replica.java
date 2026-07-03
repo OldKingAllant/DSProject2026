@@ -13,9 +13,7 @@ import vozza_lech.datastore.Update;
 
 import java.io.Serializable;
 import java.time.Duration;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Optional;
+import java.util.*;
 
 public class Replica extends AbstractReplica {
 
@@ -80,6 +78,12 @@ public class Replica extends AbstractReplica {
     java.util.Queue<QueuedWrite> m_write_queue = new java.util.LinkedList<>();
 
     boolean m_broadcast_in_progress = false;
+
+    boolean m_in_election = false;
+    Optional<Cancellable> m_election_ack_timeout = Optional.empty();
+    Optional<Cancellable> m_election_global_timeout = Optional.empty();
+    Optional<ElectionMsg> m_last_election_msg = Optional.empty();
+    Map<UpdateTimestamp, Update> m_seen_updates = new HashMap<>();
 
     //////////////////////////////////////////////////////////////
 
@@ -149,7 +153,57 @@ public class Replica extends AbstractReplica {
     }
 
     public static class BroadcastTimeout implements Serializable {}
+
     public static class WriteOKTimeout implements Serializable {}
+
+    public static class CandidateEntry implements Serializable {
+         public final int replicaId;
+         public final UpdateTimestamp lastKnownUpdate;
+         public CandidateEntry(int _replicaId, UpdateTimestamp _lastKnownUpdate) {
+             replicaId = _replicaId;
+             lastKnownUpdate = _lastKnownUpdate;
+         }
+    }
+
+    public static class ElectionMsg implements Serializable {
+         public final List<CandidateEntry> candidates;
+         public ElectionMsg(List<CandidateEntry> _candidates) {
+             candidates = _candidates;
+         }
+         // returns a new ElectionMsg with one entry appended
+         public ElectionMsg withEntry(CandidateEntry _entry) {
+             var list = new ArrayList<>(candidates);
+             list.add(_entry);
+             return new ElectionMsg(list);
+         }
+    }
+
+    public static class ElectionAckMsg implements Serializable {
+        public final int fromReplicaId;
+        public ElectionAckMsg(int _fromReplicaId) {
+            fromReplicaId = _fromReplicaId;
+        }
+    }
+
+    public static class ElectionAckTimeout implements Serializable {
+        public final int targetReplicaId;
+        public ElectionAckTimeout(int _targetReplicaId) {
+            targetReplicaId = _targetReplicaId;
+        }
+    }
+
+    //since we do one update at a time there can be only one update that is not applied to everyone
+    public static class SynchronizationMsg implements Serializable {
+         public final int newCoordinatorId;
+         public final UpdateLog.UpdatePair missingUpdate;
+         public final int newEpoch;
+         public SynchronizationMsg(int _newCoordinator, int _newEpoch, UpdateLog.UpdatePair _missingUpdate) {
+             newCoordinatorId = _newCoordinator;
+             newEpoch = _newEpoch;
+             missingUpdate = _missingUpdate;
+         }
+    }
+
     //////////////////////////////////////////////////////////////
 
 
@@ -167,6 +221,7 @@ public class Replica extends AbstractReplica {
         m_updates           = new UpdateLog();
         m_next_sn = 0;
         m_pending_updates = new HashMap<>();
+        int m_next_in_ring = -1;
         m_pending_heartbeat = Optional.empty();
         m_heartbeat_timeouts     = new HashMap<>();
         m_recv_heartbeat_timeout = Optional.empty();
@@ -254,6 +309,7 @@ public class Replica extends AbstractReplica {
     }
 
     public void onUpdateMsg(UpdateMsg _msg) {
+        m_seen_updates.put(_msg.timestamp, _msg.data);
         if (Status.CRASHED == m_curr_status) {
             return;
         }
@@ -335,6 +391,7 @@ public class Replica extends AbstractReplica {
     }
 
     public void onWriteOkMsg(WriteOkMsg _msg) {
+        m_seen_updates.remove(_msg.timestamp);
         if (Status.CRASHED == m_curr_status) {
             return;
         }
@@ -350,12 +407,91 @@ public class Replica extends AbstractReplica {
         applyUpdate(_msg.data, _msg.timestamp);
     }
 
+    private java.util.Set<Integer> m_skipped_in_ring = new java.util.HashSet<>();
+
+    private void startElection(int _crashedCoordinatorId) {
+        if (m_in_election) {
+            debug("already in election, ignoring startElection call");
+            return;
+        }
+
+        m_curr_status = Status.ELECTION;
+        m_in_election = true;
+        m_skipped_in_ring = new java.util.HashSet<>();
+
+        m_recv_heartbeat_timeout.ifPresent(Cancellable::cancel);
+        m_recv_heartbeat_timeout = Optional.empty();
+
+        callbackOnElectionStarted(_crashedCoordinatorId);
+
+        var myEntry = buildMyEntry();
+        var electionMsg = new ElectionMsg(java.util.List.of(myEntry));
+        m_last_election_msg = Optional.of(electionMsg);
+
+        var next = computeNextInRing(m_skipped_in_ring);
+        tell(electionMsg, next);
+
+        debug(String.format("started ELECTION, forwarding to %s", next.path().name()));
+
+        scheduleElectionAckTimeout(next);
+        scheduleElectionGlobalTimeout();
+    }
+
+    private void scheduleElectionAckTimeout(ActorRef _target) {
+        m_election_ack_timeout.ifPresent(Cancellable::cancel);
+        // Extract the ID from active_replicas by reverse lookup
+        int targetId = m_curr_epoch.active_replicas.entrySet().stream()
+                .filter(e -> e.getValue().equals(_target))
+                .map(Map.Entry::getKey)
+                .findFirst().orElse(-1);
+        m_election_ack_timeout = Optional.of(
+                getContext().getSystem().getScheduler().scheduleOnce(
+                        Duration.ofMillis(getMaxLatencyPlusTolerance()),
+                        getSelf(),
+                        new ElectionAckTimeout(targetId),
+                        getContext().getDispatcher(),
+                        getSelf()
+                )
+        );
+    }
+
+    private void scheduleElectionGlobalTimeout() {
+        m_election_global_timeout.ifPresent(Cancellable::cancel);
+        long delay = (long) getMaxLatencyPlusTolerance() * getSystemNumberOfActors(); //TODO check if getSystemNumberOfActors is ok
+        m_election_global_timeout = Optional.of(
+                getContext().getSystem().getScheduler().scheduleOnce(
+                        Duration.ofMillis(delay),
+                        getSelf(),
+                        new ElectionGlobalTimeout(),
+                        getContext().getDispatcher(),
+                        getSelf()
+                )
+        );
+    }
+
+    public static class ElectionGlobalTimeout implements Serializable {}
+
+    public void onHeartbeatReceiveTimeout(HeartbeatReceiveTimeout _timeout) {
+        if (Status.CRASHED == m_curr_status) return;
+        startElection(m_curr_epoch.coordinator_id);
+    }
+
     public void onBroadcastTimeout(BroadcastTimeout _timeout) {
-        //
+        if (Status.CRASHED == m_curr_status) return;
+        startElection(m_curr_epoch.coordinator_id);
     }
 
     public void onWriteOKTimeout(WriteOKTimeout _timeout) {
-        //
+        if (Status.CRASHED == m_curr_status) return;
+        startElection(m_curr_epoch.coordinator_id);
+    }
+
+    public void onElectionGlobalTimeout(ElectionGlobalTimeout _timeout) {
+        if (Status.CRASHED == m_curr_status || Status.ELECTION != m_curr_status) {
+            return;
+        }
+        m_in_election = false;
+        startElection(m_curr_epoch.coordinator_id);
     }
 
     private void applyUpdate(Update _data, UpdateTimestamp _timestamp) {
@@ -392,6 +528,10 @@ public class Replica extends AbstractReplica {
         m_broadcast_timeout = Optional.empty();
         m_writeok_timeout.ifPresent(Cancellable::cancel);
         m_writeok_timeout = Optional.empty();
+        m_election_ack_timeout.ifPresent(Cancellable::cancel);
+        m_election_ack_timeout = Optional.empty();
+        m_election_global_timeout.ifPresent(Cancellable::cancel);
+        m_election_global_timeout = Optional.empty();
     }
 
     @Override
@@ -423,6 +563,184 @@ public class Replica extends AbstractReplica {
         crash_req.crash = new Crash(how_to_crash.type, how_to_crash.after_n_messages_of_type);
         crash_req.curr_message_count = 0;
         m_crash_request = Optional.of( crash_req );
+    }
+
+    private ActorRef computeNextInRing(java.util.Set<Integer> _skip) {
+        var sortedIds = new java.util.ArrayList<>(m_curr_epoch.active_replicas.keySet());
+        java.util.Collections.sort(sortedIds);
+
+        int myIndex = sortedIds.indexOf(id);
+        int size = sortedIds.size();
+
+        for (int i = 1; i < size; i++) {
+            int nextId = sortedIds.get((myIndex + i) % size);
+            if (!_skip.contains(nextId)) {
+                return m_curr_epoch.active_replicas.get(nextId);
+            }
+        }
+
+        // Should never happen since majority is alive
+        throw new IllegalActorStateException("No reachable replica in ring");
+    }
+
+    private CandidateEntry pickWinner(java.util.List<CandidateEntry> _candidates) {
+        return _candidates.stream().max(Comparator.comparing((CandidateEntry a) -> a.lastKnownUpdate).thenComparingInt(a -> a.replicaId)).orElseThrow();
+    }
+
+    private CandidateEntry buildMyEntry() {
+        // Take the max between last applied and last seen (not yet applied)
+        UpdateTimestamp lastApplied = m_updates.getLastLogTimestamp()
+                .orElse(new UpdateTimestamp(0, 0));
+
+        UpdateTimestamp lastSeen = m_seen_updates.keySet().stream()
+                .max(UpdateTimestamp::compareTo)
+                .orElse(new UpdateTimestamp(0, 0));
+
+        UpdateTimestamp best = lastApplied.compareTo(lastSeen) >= 0 ? lastApplied : lastSeen;
+        return new CandidateEntry(id, best);
+    }
+
+    public void onElectionMsg(ElectionMsg _msg){
+        if (m_curr_status == Status.CRASHED) {
+            return;
+        }
+        tell(new ElectionAckMsg(id), getSender());
+
+        boolean hasMyEntry = _msg.candidates.stream().anyMatch(c -> c.replicaId == id);
+        if (hasMyEntry) {
+            var winner = pickWinner(_msg.candidates);
+            debug(String.format("ELECTION complete, winner is %d", winner.replicaId));
+
+            if (winner.replicaId == id){
+                becomeCoordinator();
+            } else {
+                var next = computeNextInRing(m_skipped_in_ring);
+                m_last_election_msg = Optional.of(_msg);
+                tell(_msg, next);
+                scheduleElectionAckTimeout(next);
+            }
+            return;
+        }
+
+        if (!m_in_election){
+            m_in_election = true;
+            m_curr_status = Status.ELECTION;
+            m_skipped_in_ring = new java.util.HashSet<>();
+            callbackOnElectionStarted(m_curr_epoch.coordinator_id);
+            scheduleElectionGlobalTimeout();
+        }
+
+        var updated = _msg.withEntry(buildMyEntry());
+        m_last_election_msg = Optional.of(updated);
+        var next = computeNextInRing(m_skipped_in_ring);
+        tell(updated, next);
+        scheduleElectionAckTimeout(next);
+
+        debug(String.format("forwarding ELECTION to %s", next.path().name()));
+    }
+
+    public void onElectionAckMsg(ElectionAckMsg _msg){
+        if (m_curr_status == Status.CRASHED){
+            return;
+        }
+        m_election_ack_timeout.ifPresent(Cancellable::cancel);
+        m_last_election_msg = Optional.empty();
+    }
+
+    public void onElectionAckTimeout(ElectionAckTimeout _timeout) {
+        if (Status.CRASHED == m_curr_status || Status.ELECTION != m_curr_status) {
+            return;
+        }
+        debug(String.format("ELECTION ACK timeout, skipping replica %d", _timeout.targetReplicaId));
+        m_skipped_in_ring.add(_timeout.targetReplicaId);
+        m_curr_epoch.active_replicas.remove(_timeout.targetReplicaId);
+
+        var msgToForward = m_last_election_msg.orElseThrow();
+        var next = computeNextInRing(m_skipped_in_ring);
+        tell(msgToForward, next);
+        scheduleElectionAckTimeout(next);
+    }
+
+    private void becomeCoordinator(){
+        m_curr_epoch.id++;
+        m_curr_epoch.coordinator_id = id;
+        m_next_sn = 0;
+        callbackOnCoordinatorElected(id);
+
+        UpdateLog.UpdatePair missingUpdate = null;
+        for (var entry : m_seen_updates.entrySet()) {
+            if (!m_updates.contains(entry.getKey())) {
+                missingUpdate = new UpdateLog.UpdatePair(entry.getValue(), entry.getKey());
+                m_updates.addLog(entry.getValue(), entry.getKey());
+                applyUpdate(entry.getValue(), entry.getKey());
+                break; // non dovrebbe essercene più di uno
+            }
+        }
+        m_seen_updates.clear();
+
+        var syncMsg = new SynchronizationMsg(id, m_curr_epoch.id, missingUpdate);
+
+        m_curr_epoch.active_replicas.forEach((_id, _ref) -> {
+            if (_id != id) tell(syncMsg, _ref);
+        });
+
+        m_election_ack_timeout.ifPresent(Cancellable::cancel);
+        m_election_ack_timeout = Optional.empty();
+        m_election_global_timeout.ifPresent(Cancellable::cancel);
+        m_election_global_timeout = Optional.empty();
+
+        m_in_election = false;
+        m_curr_status = Status.IDLE;
+
+        m_pending_heartbeat = Optional.of(
+                getContext().getSystem().getScheduler().scheduleAtFixedRate(
+                        Duration.ofMillis(getCoordinatorBeatInterval()),
+                        Duration.ofMillis(getCoordinatorBeatInterval()),
+                        getSelf(),
+                        new RunHeartbeat(),
+                        getContext().getDispatcher(),
+                        getSelf()
+                )
+        );
+
+        debug(String.format("became new coordinator, epoch %d", m_curr_epoch.id));
+        tryStartNextBroadcast(); // FIFO garantisce che questo arrivi dopo il syncMsg
+    }
+
+    public void onSynchronizationMsg(SynchronizationMsg _msg){
+        if (m_curr_status == Status.CRASHED){
+            return;
+        }
+        m_curr_epoch.coordinator_id = _msg.newCoordinatorId;
+        m_curr_epoch.id = _msg.newEpoch;
+
+        if (_msg.missingUpdate != null && m_updates.addLogIfAbsent(_msg.missingUpdate.data, _msg.missingUpdate.timestamp)) {
+                applyUpdate(_msg.missingUpdate.data, _msg.missingUpdate.timestamp);
+        }
+
+        m_seen_updates.clear();
+        callbackOnCoordinatorElected(_msg.newCoordinatorId);
+
+        m_election_global_timeout.ifPresent(Cancellable::cancel);
+        m_election_global_timeout = Optional.empty();
+        m_election_ack_timeout.ifPresent(Cancellable::cancel);
+        m_election_ack_timeout = Optional.empty();
+        m_in_election = false;
+        m_curr_status = Status.IDLE;
+
+        m_recv_heartbeat_timeout.ifPresent(Cancellable::cancel);
+        m_recv_heartbeat_timeout = Optional.of(
+                getContext().getSystem().getScheduler().scheduleOnce(
+                        Duration.ofMillis(getCoordinatorBeatInterval() * 2L),
+                        getSelf(),
+                        new HeartbeatReceiveTimeout(),
+                        getContext().getDispatcher(),
+                        getSelf()
+                )
+        );
+
+        debug(String.format("synchronized with new coordinator %d, epoch %d",
+                _msg.newCoordinatorId, _msg.newEpoch));
     }
 
     @Override
@@ -595,13 +913,6 @@ public class Replica extends AbstractReplica {
         }
     }
 
-    public void onHeartbeatReceiveTimeout(HeartbeatReceiveTimeout _timeout) {
-        /// Coordinator silently crashed, run election algorithm
-    }
-
-    // public void onWriteResult(AbstractClient.WriteResult _result) {
-    //     debug(String.format("replica %d received write RESULT", id));
-    // }
 
     @Override
     public final Receive createReceive() {
@@ -619,7 +930,11 @@ public class Replica extends AbstractReplica {
                 .match(HeartbeatResponse.class, this::onHeartbeatResponse)
                 .match(HeartbeatRequest.class, this::onHeartbeatRequest)
                 .match(HeartbeatReceiveTimeout.class, this::onHeartbeatReceiveTimeout)
+                .match(ElectionMsg.class,        this::onElectionMsg)
+                .match(ElectionAckMsg.class,     this::onElectionAckMsg)
+                .match(ElectionAckTimeout.class, this::onElectionAckTimeout)
+                .match(SynchronizationMsg.class, this::onSynchronizationMsg)
+                .match(ElectionGlobalTimeout.class, this::onElectionGlobalTimeout)
                 .build();
     }
-
 }

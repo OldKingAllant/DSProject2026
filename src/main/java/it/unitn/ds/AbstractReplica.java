@@ -94,7 +94,7 @@ public abstract class AbstractReplica extends AbstractActor {
     // =================================================================================
 
     void tell(Serializable m, ActorRef dst) {
-        // Lazily create one channel actor per destination
+        // Create one channel actor per destination
         ActorRef channel = channels.computeIfAbsent(dst, d -> getContext().actorOf(
                 NetworkChannel.props(d, getMinLatency(), getMaxLatency()),
                 "channel_to_" + d.path().name()));
