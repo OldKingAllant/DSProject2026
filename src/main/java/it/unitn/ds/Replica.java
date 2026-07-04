@@ -30,7 +30,6 @@ public class Replica extends AbstractReplica {
         m_updates           = new UpdateLog();
         m_next_sn = 0;
         m_pending_updates = new HashMap<>();
-        int m_next_in_ring = -1;
         m_pending_heartbeat = Optional.empty();
         m_heartbeat_timeouts     = new HashMap<>();
         m_recv_heartbeat_timeout = Optional.empty();
@@ -40,8 +39,7 @@ public class Replica extends AbstractReplica {
 
     @Override
     public int getSystemNumberOfActors() {
-        // TODO: Change this
-        return m_curr_epoch.active_replicas.size();
+        return m_total_replicas;
     }
 
     //region INNER CLASSES — State
@@ -239,6 +237,8 @@ public class Replica extends AbstractReplica {
 
     private java.util.Set<Integer> m_skipped_in_ring = new java.util.HashSet<>();
 
+    int m_total_replicas = 0;
+
     //endregion
 
     //region LIFECYCLE
@@ -259,6 +259,8 @@ public class Replica extends AbstractReplica {
         //TODO check that this is ok
         //m_curr_epoch.active_replicas = Map.copyOf(sysInit.group);
         m_curr_epoch.active_replicas = new HashMap<>(sysInit.group);
+
+        m_total_replicas = sysInit.group.size();
 
         m_curr_epoch.id              = 0;
         m_curr_epoch.coordinator_id  = sysInit.coordinator_id;
@@ -920,7 +922,7 @@ public class Replica extends AbstractReplica {
 
     private void scheduleElectionGlobalTimeout() {
         m_election_global_timeout.ifPresent(Cancellable::cancel);
-        long delay = (long) getMaxLatencyPlusTolerance() * getSystemNumberOfActors(); //TODO check if getSystemNumberOfActors is ok
+        long delay = (long) getMaxLatencyPlusTolerance() * getSystemNumberOfActors();
         m_election_global_timeout = Optional.of(
                 getContext().getSystem().getScheduler().scheduleOnce(
                         Duration.ofMillis(delay),
