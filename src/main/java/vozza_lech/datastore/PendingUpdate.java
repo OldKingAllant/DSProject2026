@@ -11,13 +11,15 @@ public class PendingUpdate implements Serializable {
     private final UpdateTimestamp m_timestamp;
     private final ActorRef m_client;
     private final Set<Integer> m_acks;
+    private final ActorRef m_initiator;
 
-    public PendingUpdate(Update _data, UpdateTimestamp _timestamp, ActorRef _client, int _coordinatorId) {
+    public PendingUpdate(Update _data, UpdateTimestamp _timestamp, ActorRef _client, int _coordinatorId, ActorRef _initiator) {
         m_data = _data;
         m_timestamp = _timestamp;
         m_client = _client;
         m_acks = new HashSet<>();
         m_acks.add(_coordinatorId);
+        m_initiator = _initiator;
     }
 
     public Update getData() {
@@ -39,6 +41,8 @@ public class PendingUpdate implements Serializable {
     public boolean hasQuorum(int _quorumSize) {
         return m_acks.size() >= _quorumSize;
     }
+
+    public ActorRef getInitiator() { return m_initiator; }
 
     @Override
     public String toString() {

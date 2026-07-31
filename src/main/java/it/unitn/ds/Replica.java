@@ -47,7 +47,7 @@ public class Replica extends AbstractReplica {
     public static class Epoch {
         public int                    id;
         /// Local map of active replicas.
-        /// Only useful to avoid sending messages to them
+        /// Only useful to avoid sending messages to crashed replicas
         public Map<Integer, ActorRef> active_replicas;
         public int                    coordinator_id;
     }
@@ -82,7 +82,7 @@ public class Replica extends AbstractReplica {
     public static class RunHeartbeat implements Serializable { }
 
     public static class HeartbeatRequest implements Serializable {
-        public ActorRef coordinator;
+        public final ActorRef coordinator;
 
         public HeartbeatRequest(ActorRef _coord) {
             coordinator = _coord;
@@ -90,8 +90,8 @@ public class Replica extends AbstractReplica {
     }
 
     public static class HeartbeatResponse implements Serializable {
-        public ActorRef replica;
-        public int      replica_id;
+        public final ActorRef replica;
+        public final int      replica_id;
 
         public HeartbeatResponse(ActorRef _replica, int _replica_id) {
             replica    = _replica;
@@ -100,8 +100,8 @@ public class Replica extends AbstractReplica {
     }
 
     public static class HeartbeatRequestTimeout implements Serializable {
-        public ActorRef replica;
-        public int      replica_id;
+        public final ActorRef replica;
+        public final int      replica_id;
 
         public HeartbeatRequestTimeout(ActorRef _replica, int _replica_id) {
             replica    = _replica;
@@ -115,10 +115,12 @@ public class Replica extends AbstractReplica {
     public static class UpdateMsg implements Serializable {
         public final UpdateTimestamp timestamp;
         public final Update data;
+        public final ActorRef initiator;
 
-        public UpdateMsg(UpdateTimestamp _timestamp, Update _data) {
+        public UpdateMsg(UpdateTimestamp _timestamp, Update _data, ActorRef _initiator) {
             timestamp = _timestamp;
             data = _data;
+            initiator = _initiator;
         }
     }
 
@@ -137,10 +139,12 @@ public class Replica extends AbstractReplica {
     public static class WriteOkMsg implements Serializable {
         public final UpdateTimestamp timestamp;
         public final Update data;
+        public final ActorRef initiator;
 
-        public WriteOkMsg(UpdateTimestamp _timestamp, Update _data) {
+        public WriteOkMsg(UpdateTimestamp _timestamp, Update _data, ActorRef _initiator) {
             timestamp = _timestamp;
             data = _data;
+            initiator = _initiator;
         }
     }
 
@@ -187,9 +191,9 @@ public class Replica extends AbstractReplica {
     //since we do one update at a time there can be only one update that is not applied to everyone
     public static class SynchronizationMsg implements Serializable {
         public final int newCoordinatorId;
-        public final UpdateLog.UpdatePair missingUpdate;
+        public final UpdateLog.UpdateInfo missingUpdate;
         public final int newEpoch;
-        public SynchronizationMsg(int _newCoordinator, int _newEpoch, UpdateLog.UpdatePair _missingUpdate) {
+        public SynchronizationMsg(int _newCoordinator, int _newEpoch, UpdateLog.UpdateInfo _missingUpdate) {
             newCoordinatorId = _newCoordinator;
             newEpoch = _newEpoch;
             missingUpdate = _missingUpdate;
@@ -216,6 +220,8 @@ public class Replica extends AbstractReplica {
     PositionList           m_position_list;
     UpdateLog              m_updates;
 
+    Queue<QueuedWrite> m_requested_updates = new LinkedList<>();
+
     int m_next_sn;
     Map<UpdateTimestamp, PendingUpdate> m_pending_updates;
 
@@ -225,7 +231,7 @@ public class Replica extends AbstractReplica {
     // Queue of write requests waiting to be broadcast.
     // The coordinator processes only one update at a time to preserve total order:
     // the next request is dequeued only after WRITEOK for the current one is sent.
-    java.util.Queue<QueuedWrite> m_write_queue = new java.util.LinkedList<>();
+    Queue<QueuedWrite> m_write_queue = new LinkedList<>();
 
     boolean m_broadcast_in_progress = false;
 
@@ -233,9 +239,16 @@ public class Replica extends AbstractReplica {
     Optional<Cancellable> m_election_ack_timeout = Optional.empty();
     Optional<Cancellable> m_election_global_timeout = Optional.empty();
     Optional<ElectionMsg> m_last_election_msg = Optional.empty();
-    Map<UpdateTimestamp, Update> m_seen_updates = new HashMap<>();
 
-    private java.util.Set<Integer> m_skipped_in_ring = new java.util.HashSet<>();
+    public record Pair<K, V>(K key, V value)
+    {
+        // intentionally empty
+    }
+
+    Optional<Pair<UpdateTimestamp, UpdateMsg>> m_in_flight_update = Optional.empty();
+    // Map<UpdateTimestamp, Update> m_seen_updates = new HashMap<>();
+
+    private Set<Integer> m_skipped_in_ring = new HashSet<>();
 
     int m_total_replicas = 0;
 
@@ -358,6 +371,7 @@ public class Replica extends AbstractReplica {
     public void onCrashInEffect() {
         // Cancel all events and mark this
         // replica as crashed
+        debug(String.format("replica %d CRASHED", id));
         m_curr_status = Status.CRASHED;
         m_pending_heartbeat.ifPresent(Cancellable::cancel);
         m_pending_heartbeat = Optional.empty();
@@ -398,31 +412,66 @@ public class Replica extends AbstractReplica {
             return;
         }
 
+        _request.replica = getSelf();
+
         if (id == m_curr_epoch.coordinator_id) {
             // Enqueue and try to start broadcast (starts immediately if nothing in flight)
             m_write_queue.add(new QueuedWrite(_request, getSender()));
             tryStartNextBroadcast();
 
             if(m_crash_request.isPresent() && Crash.Type.Update == m_crash_request.get().crash.type) {
-                onCrashInEffect();
+                var crash_internal = m_crash_request.get();
+                crash_internal.curr_message_count++;
+                if(crash_internal.curr_message_count >= crash_internal.crash.after_n_messages_of_type) {
+                    onCrashInEffect();
+                }
             }
         } else {
-            // Not the coordinator: just forward the request along.
-            var coordinator_ref = m_curr_epoch.active_replicas.get(m_curr_epoch.coordinator_id);
             var queued_write = new QueuedWrite(_request, getSender());
-            coordinator_ref.tell(queued_write, getSelf());
-            // TODO (later, with crash handling): start a timeout here to detect a C that never initiates the broadcast.
-            m_broadcast_timeout = Optional.of(
-                    getContext().getSystem()
-                            .getScheduler()
-                            .scheduleOnce(
-                                    Duration.ofMillis(getMaxLatencyPlusTolerance()),
-                                    getSelf(),
-                                    new BroadcastTimeout(),
-                                    getContext().getDispatcher(),
-                                    getSelf()
-                            )
-            );
+
+            // Can simply put them in the queue because:
+            // messages are removed from the queue
+            // only on apply update. If the
+            // coordinator crashes, messages
+            // in its queue that are not sent
+            // will be lost, either way, messages
+            // that have not been sent or cannot
+            // be completed will never be removed
+            // from the queue, but they will be
+            // sent in bulk when the new
+            // coordinator is elected.
+            // So if we put both sent and
+            // not sent messages in this queue,
+            // it will be ok
+            m_requested_updates.add(queued_write);
+
+            if(Status.ELECTION != m_curr_status) {
+                // Not the coordinator: just forward the request along.
+                var coordinator_ref = m_curr_epoch.active_replicas.get(m_curr_epoch.coordinator_id);
+                coordinator_ref.tell(queued_write, getSelf());
+                // TODO (later, with crash handling): start a timeout here to detect a C that never initiates the broadcast.
+                m_broadcast_timeout = Optional.of(
+                        getContext().getSystem()
+                                .getScheduler()
+                                .scheduleOnce(
+                                        Duration.ofMillis(getMaxLatencyPlusTolerance()),
+                                        getSelf(),
+                                        new BroadcastTimeout(),
+                                        getContext().getDispatcher(),
+                                        getSelf()
+                                )
+                );
+            }
+            // Else they will be sent after the election is complete
+
+            if(m_crash_request.isPresent() && Crash.Type.Update == m_crash_request.get().crash.type) {
+                var crash_internal = m_crash_request.get();
+                crash_internal.curr_message_count++;
+                if(crash_internal.curr_message_count >= crash_internal.crash.after_n_messages_of_type) {
+                    onCrashInEffect();
+                }
+            }
+
         }
     }
 
@@ -460,7 +509,7 @@ public class Replica extends AbstractReplica {
         var timestamp = new UpdateTimestamp(m_curr_epoch.id, m_next_sn);
         m_next_sn++;
 
-        var pending = new PendingUpdate(data, timestamp, queuedWrite.client, id);
+        var pending = new PendingUpdate(data, timestamp, queuedWrite.client, id, queuedWrite.request.replica);
         m_pending_updates.put(timestamp, pending);
 
         debug(String.format("broadcasting UPDATE %d:%d (%d, %d)",
@@ -468,7 +517,7 @@ public class Replica extends AbstractReplica {
 
         m_curr_epoch.active_replicas.forEach((_id, _ref) -> {
             if (_id == id) return;
-            tell(new UpdateMsg(timestamp, data), _ref);
+            tell(new UpdateMsg(timestamp, data, queuedWrite.request.replica), _ref);
         });
     }
 
@@ -480,7 +529,8 @@ public class Replica extends AbstractReplica {
         if (Status.CRASHED == m_curr_status) {
             return;
         }
-        m_seen_updates.put(_msg.timestamp, _msg.data);
+
+        m_in_flight_update = Optional.of(new Pair<>(_msg.timestamp, _msg));
 
         m_broadcast_timeout.ifPresent(Cancellable::cancel);
         m_broadcast_timeout = Optional.empty();
@@ -534,7 +584,7 @@ public class Replica extends AbstractReplica {
         int quorumSize = (getSystemNumberOfActors() / 2) + 1;
         if (pending.hasQuorum(quorumSize)) {
             m_pending_updates.remove(_msg.timestamp);
-            m_updates.addLog(pending.getData(), pending.getTimestamp());
+            m_updates.addLog(pending.getData(), pending.getTimestamp(), pending.getInitiator());
 
             debug(String.format("quorum reached for %d:%d, broadcasting WRITEOK",
                     _msg.timestamp.getEpoch(), _msg.timestamp.getSn()));
@@ -543,11 +593,11 @@ public class Replica extends AbstractReplica {
                 if (_id == id) {
                     return;
                 }
-                tell(new WriteOkMsg(pending.getTimestamp(), pending.getData()), _ref);
+                tell(new WriteOkMsg(pending.getTimestamp(), pending.getData(), pending.getInitiator()), _ref);
             });
 
             // Apply locally too (coordinator is also a replica) and reply to client
-            applyUpdate(pending.getData(), pending.getTimestamp());
+            applyUpdate(pending.getData(), pending.getTimestamp(), pending.getInitiator());
 
             m_broadcast_in_progress = false;
             tryStartNextBroadcast(); // start next write if any are queued
@@ -562,7 +612,8 @@ public class Replica extends AbstractReplica {
         if (Status.CRASHED == m_curr_status) {
             return;
         }
-        m_seen_updates.remove(_msg.timestamp);
+
+        m_in_flight_update = Optional.empty();
 
         m_writeok_timeout.ifPresent(Cancellable::cancel);
         m_writeok_timeout = Optional.empty();
@@ -571,11 +622,24 @@ public class Replica extends AbstractReplica {
                 _msg.timestamp.getEpoch(), _msg.timestamp.getSn(),
                 _msg.data.getIndex(), _msg.data.getPosition()));
 
-        m_updates.addLog(_msg.data, _msg.timestamp);
-        applyUpdate(_msg.data, _msg.timestamp);
+        m_updates.addLog(_msg.data, _msg.timestamp, _msg.initiator);
+        applyUpdate(_msg.data, _msg.timestamp, _msg.initiator);
+
+        if(m_crash_request.isPresent() && Crash.Type.WriteOK == m_crash_request.get().crash.type) {
+            var crash_internal = m_crash_request.get();
+            crash_internal.curr_message_count++;
+            if(crash_internal.curr_message_count >= crash_internal.crash.after_n_messages_of_type) {
+                onCrashInEffect();
+            }
+        }
     }
 
-    private void applyUpdate(Update _data, UpdateTimestamp _timestamp) {
+    private void applyUpdate(Update _data, UpdateTimestamp _timestamp, ActorRef _initiator) {
+        if(_initiator.equals(getSelf())) {
+            // Message was propagated by us, remove
+            // it from the queue. 
+            m_requested_updates.poll();
+        }
         m_position_list.updatePerson(_data.getIndex(), _data.getPosition(), _timestamp);
         callbackOnUpdateApplied(_data.getIndex(), _data.getPosition());
         log(String.format("applied update %d:%d (%d, %d)",
@@ -592,25 +656,16 @@ public class Replica extends AbstractReplica {
             throw new IllegalActorStateException("Running heartbeat on non-coordinator replica");
         }
 
-        // Check if we should crash before sending heartbeats
-        if(m_crash_request.isPresent() && Crash.Type.Heartbeat == m_crash_request.get().crash.type) {
-            var crash_internal = m_crash_request.get();
-            crash_internal.curr_message_count++;
-            if(crash_internal.curr_message_count >= crash_internal.crash.after_n_messages_of_type) {
-                onCrashInEffect();
-                return;
-            }
-        }
-
         debug(String.format("running HEARTBEAT from %d", id));
 
         m_curr_epoch
                 .active_replicas
                 .forEach((_id, _ref) -> {
-                    // Do not send to self
-                    if(_id == id) {
+                    // Do not send to self or crashed
+                    if(Status.CRASHED == m_curr_status || _id == id) {
                         return;
                     }
+
                     // Send heartbeat and schedule timeout
                     _ref.tell(new HeartbeatRequest(getSelf()), getSelf());
                     m_heartbeat_timeouts.put(_id,
@@ -624,6 +679,15 @@ public class Replica extends AbstractReplica {
                                             getSelf()
                                     )
                     );
+
+                    // Check if we should crash before sending heartbeat
+                    if(m_crash_request.isPresent() && Crash.Type.Heartbeat == m_crash_request.get().crash.type) {
+                        var crash_internal = m_crash_request.get();
+                        crash_internal.curr_message_count++;
+                        if(crash_internal.curr_message_count >= crash_internal.crash.after_n_messages_of_type) {
+                            onCrashInEffect();
+                        }
+                    }
                 });
     }
 
@@ -700,6 +764,7 @@ public class Replica extends AbstractReplica {
 
     public void onHeartbeatReceiveTimeout(HeartbeatReceiveTimeout _timeout) {
         if (Status.CRASHED == m_curr_status) return;
+        debug(String.format("replica %d HEARTBEAT timeout", id));
         startElection(m_curr_epoch.coordinator_id);
     }
 
@@ -718,6 +783,7 @@ public class Replica extends AbstractReplica {
         m_curr_status = Status.ELECTION;
         m_in_election = true;
         m_skipped_in_ring = new java.util.HashSet<>();
+        m_skipped_in_ring.add(_crashedCoordinatorId);
 
         m_recv_heartbeat_timeout.ifPresent(Cancellable::cancel);
         m_recv_heartbeat_timeout = Optional.empty();
@@ -752,10 +818,27 @@ public class Replica extends AbstractReplica {
                 becomeCoordinator();
             } else {
                 var next = computeNextInRing(m_skipped_in_ring);
-                m_last_election_msg = Optional.of(_msg);
-                tell(_msg, next);
-                scheduleElectionAckTimeout(next);
+                var next_id = m_curr_epoch.active_replicas.entrySet()
+                        .stream()
+                        .filter((_entry) -> _entry.getValue().equals(next))
+                        .map(Map.Entry::getKey)
+                        .findFirst();
+
+                if(next_id.isEmpty() || next_id.get() != winner.replicaId) {
+                    m_last_election_msg = Optional.of(_msg);
+                    tell(_msg, next);
+                    scheduleElectionAckTimeout(next);
+                }
             }
+
+            if(m_crash_request.isPresent() && Crash.Type.Election == m_crash_request.get().crash.type) {
+                var crash_internal = m_crash_request.get();
+                crash_internal.curr_message_count++;
+                if(crash_internal.curr_message_count >= crash_internal.crash.after_n_messages_of_type) {
+                    onCrashInEffect();
+                }
+            }
+
             return;
         }
 
@@ -774,6 +857,14 @@ public class Replica extends AbstractReplica {
         scheduleElectionAckTimeout(next);
 
         debug(String.format("forwarding ELECTION to %s", next.path().name()));
+
+        if(m_crash_request.isPresent() && Crash.Type.Election == m_crash_request.get().crash.type) {
+            var crash_internal = m_crash_request.get();
+            crash_internal.curr_message_count++;
+            if(crash_internal.curr_message_count >= crash_internal.crash.after_n_messages_of_type) {
+                onCrashInEffect();
+            }
+        }
     }
 
     public void onElectionAckMsg(ElectionAckMsg _msg){
@@ -782,27 +873,49 @@ public class Replica extends AbstractReplica {
         }
         m_election_ack_timeout.ifPresent(Cancellable::cancel);
         m_election_ack_timeout = Optional.empty();
+
+        if(m_crash_request.isPresent() && Crash.Type.Election == m_crash_request.get().crash.type) {
+            var crash_internal = m_crash_request.get();
+            crash_internal.curr_message_count++;
+            if(crash_internal.curr_message_count >= crash_internal.crash.after_n_messages_of_type) {
+                onCrashInEffect();
+            }
+        }
     }
 
     private void becomeCoordinator(){
+        callbackOnCoordinatorElected(id);
+
         m_curr_epoch.id++;
         m_curr_epoch.coordinator_id = id;
         m_next_sn = 0;
-        callbackOnCoordinatorElected(id);
 
-        UpdateLog.UpdatePair missingUpdate = null;
-        for (var entry : m_seen_updates.entrySet()) {
-            if (!m_updates.contains(entry.getKey())) {
-                missingUpdate = new UpdateLog.UpdatePair(entry.getValue(), entry.getKey());
-                m_updates.addLog(entry.getValue(), entry.getKey());
-                applyUpdate(entry.getValue(), entry.getKey());
-                break; // non dovrebbe essercene più di uno
+        UpdateLog.UpdateInfo missingUpdate = null;
+        if (m_in_flight_update.isPresent()) { // Check if update in flight
+            // That update cannot have been applied, no writeok
+            var update = m_in_flight_update.get();
+            missingUpdate = new UpdateLog.UpdateInfo(update.value().data, update.key(), update.value().initiator);
+            m_updates.addLog(update.value().data, update.key(), update.value().initiator);
+            applyUpdate(update.value().data, update.key(), update.value().initiator);
+        } else if(m_updates.getLastLogTimestamp().isPresent()) {
+            // Else, push the last applied update,
+            // since we do not know if everyone
+            // has applied it
+            var last_stamp = m_updates.getLastLogTimestamp().get();
+            var last_update = m_updates.getLog(last_stamp);
+
+            if(last_update.isPresent()) {
+                missingUpdate = new UpdateLog.UpdateInfo(last_update.get().data, last_stamp, last_update.get().initiator);
             }
         }
-        m_seen_updates.clear();
+
+        // If any update was in flight, it has been applied
+        // in the previous lines
+        m_in_flight_update = Optional.empty();
 
         var syncMsg = new SynchronizationMsg(id, m_curr_epoch.id, missingUpdate);
 
+        // Now send the sync message to all known active replicas
         m_curr_epoch.active_replicas.forEach((_id, _ref) -> {
             if (_id != id) tell(syncMsg, _ref);
         });
@@ -827,6 +940,13 @@ public class Replica extends AbstractReplica {
         );
 
         debug(String.format("became new coordinator, epoch %d", m_curr_epoch.id));
+
+        // If we had halted updates, enqueue them now
+        for(var update : m_requested_updates) {
+            onQueuedWrite(update);
+        }
+        m_requested_updates.clear();
+
         tryStartNextBroadcast(); // FIFO grants this arrives after syncMsg
     }
 
@@ -834,14 +954,18 @@ public class Replica extends AbstractReplica {
         if (m_curr_status == Status.CRASHED){
             return;
         }
+
+        if (_msg.missingUpdate != null && m_updates.addLogIfAbsent(_msg.missingUpdate.data, _msg.missingUpdate.timestamp,
+                _msg.missingUpdate.initiator)) {
+            applyUpdate(_msg.missingUpdate.data, _msg.missingUpdate.timestamp, _msg.missingUpdate.initiator);
+        }
+
         m_curr_epoch.coordinator_id = _msg.newCoordinatorId;
         m_curr_epoch.id = _msg.newEpoch;
 
-        if (_msg.missingUpdate != null && m_updates.addLogIfAbsent(_msg.missingUpdate.data, _msg.missingUpdate.timestamp)) {
-            applyUpdate(_msg.missingUpdate.data, _msg.missingUpdate.timestamp);
-        }
-
-        m_seen_updates.clear();
+        // If any update was in flight, it for sure
+        // has been applied through the sync message
+        m_in_flight_update = Optional.empty();
         callbackOnCoordinatorElected(_msg.newCoordinatorId);
 
         m_election_global_timeout.ifPresent(Cancellable::cancel);
@@ -864,11 +988,27 @@ public class Replica extends AbstractReplica {
 
         debug(String.format("synchronized with new coordinator %d, epoch %d",
                 _msg.newCoordinatorId, _msg.newEpoch));
+
+        if(m_crash_request.isPresent() && Crash.Type.Election == m_crash_request.get().crash.type) {
+            var crash_internal = m_crash_request.get();
+            crash_internal.curr_message_count++;
+            if(crash_internal.curr_message_count >= crash_internal.crash.after_n_messages_of_type) {
+                onCrashInEffect();
+                return;
+            }
+        }
+
+        // Forward all halted updates to the new coordinator
+        var coordinator_ref = m_curr_epoch.active_replicas.get(m_curr_epoch.coordinator_id);
+        for(var update : m_requested_updates) {
+            coordinator_ref.tell(update, getSelf());
+        }
+        m_requested_updates.clear();
     }
 
-    private ActorRef computeNextInRing(java.util.Set<Integer> _skip) {
-        var sortedIds = new java.util.ArrayList<>(m_curr_epoch.active_replicas.keySet());
-        java.util.Collections.sort(sortedIds);
+    private ActorRef computeNextInRing(Set<Integer> _skip) {
+        var sortedIds = new ArrayList<>(m_curr_epoch.active_replicas.keySet());
+        Collections.sort(sortedIds);
 
         int myIndex = sortedIds.indexOf(id);
         int size = sortedIds.size();
@@ -884,13 +1024,16 @@ public class Replica extends AbstractReplica {
         throw new IllegalActorStateException("No reachable replica in ring");
     }
 
-    private CandidateEntry pickWinner(java.util.List<CandidateEntry> _candidates) {
+    private CandidateEntry pickWinner(List<CandidateEntry> _candidates) {
         return _candidates.stream().max(Comparator.comparing((CandidateEntry a) -> a.lastKnownUpdate).thenComparingInt(a -> a.replicaId)).orElseThrow();
     }
 
     private CandidateEntry buildMyEntry() {
-        UpdateTimestamp lastApplied = m_updates.getLastLogTimestamp()
-                .orElse(new UpdateTimestamp(0, 0));
+        // First check if there is an incomplete update and use that
+        // as the last known update, else use the last writeoked
+        // update
+        UpdateTimestamp lastApplied = m_in_flight_update.map(Pair::key).orElse(m_updates.getLastLogTimestamp()
+                .orElse(new UpdateTimestamp(0, 0)));
         return new CandidateEntry(id, lastApplied);
     }
 
@@ -898,6 +1041,7 @@ public class Replica extends AbstractReplica {
         if (Status.CRASHED == m_curr_status || Status.ELECTION != m_curr_status) {
             return;
         }
+        debug(String.format("replica %d ELECTION timeout", id));
         m_in_election = false;
         startElection(m_curr_epoch.coordinator_id);
     }
@@ -950,11 +1094,13 @@ public class Replica extends AbstractReplica {
 
     public void onBroadcastTimeout(BroadcastTimeout _timeout) {
         if (Status.CRASHED == m_curr_status) return;
+        debug(String.format("replica %d BROADCAST timeout", id));
         startElection(m_curr_epoch.coordinator_id);
     }
 
     public void onWriteOKTimeout(WriteOKTimeout _timeout) {
         if (Status.CRASHED == m_curr_status) return;
+        debug(String.format("replica %d WRITEOK timeout", id));
         startElection(m_curr_epoch.coordinator_id);
     }
 
