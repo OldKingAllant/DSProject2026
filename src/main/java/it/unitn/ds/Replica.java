@@ -163,14 +163,19 @@ public class Replica extends AbstractReplica {
 
     public static class ElectionMsg implements Serializable {
         public final List<CandidateEntry> candidates;
-        public ElectionMsg(List<CandidateEntry> _candidates) {
+        public final int for_crashed_coordinator;
+        public final int old_epoch_id;
+
+        public ElectionMsg(List<CandidateEntry> _candidates, int _crashed_coord, int _old_epoch) {
             candidates = _candidates;
+            for_crashed_coordinator = _crashed_coord;
+            old_epoch_id = _old_epoch;
         }
         // returns a new ElectionMsg with one entry appended
         public ElectionMsg withEntry(CandidateEntry _entry) {
             var list = new ArrayList<>(candidates);
             list.add(_entry);
-            return new ElectionMsg(list);
+            return new ElectionMsg(list, this.for_crashed_coordinator, this.old_epoch_id);
         }
     }
 
@@ -791,7 +796,7 @@ public class Replica extends AbstractReplica {
         callbackOnElectionStarted(_crashedCoordinatorId);
 
         var myEntry = buildMyEntry();
-        var electionMsg = new ElectionMsg(java.util.List.of(myEntry));
+        var electionMsg = new ElectionMsg(java.util.List.of(myEntry), _crashedCoordinatorId, m_curr_epoch.id);
         m_last_election_msg = Optional.of(electionMsg);
 
         var next = computeNextInRing(m_skipped_in_ring);
@@ -809,6 +814,25 @@ public class Replica extends AbstractReplica {
         }
         tell(new ElectionAckMsg(id), getSender());
 
+        if(_msg.for_crashed_coordinator != m_curr_epoch.coordinator_id) {
+            // Coordinator was already elected,
+            // avoid circulating the same election
+            // indefinitely
+
+            // The only important thing is that the new coordinator should receive
+            // the complete election list. The following replicas have no need
+            // to do that, only to sync with the coordinator
+            if(m_crash_request.isPresent() && Crash.Type.Election == m_crash_request.get().crash.type) {
+                var crash_internal = m_crash_request.get();
+                crash_internal.curr_message_count++;
+                if(crash_internal.curr_message_count >= crash_internal.crash.after_n_messages_of_type) {
+                    onCrashInEffect();
+                }
+            }
+
+            return;
+        }
+
         boolean hasMyEntry = _msg.candidates.stream().anyMatch(c -> c.replicaId == id);
         if (hasMyEntry) {
             var winner = pickWinner(_msg.candidates);
@@ -818,6 +842,15 @@ public class Replica extends AbstractReplica {
                 becomeCoordinator();
             } else {
                 var next = computeNextInRing(m_skipped_in_ring);
+                m_last_election_msg = Optional.of(_msg);
+                tell(_msg, next);
+                scheduleElectionAckTimeout(next);
+
+                /*
+                Not ok, in case of more than two replicas active
+                in the ring, the new coordinator might
+                not receive the complete election
+
                 var next_id = m_curr_epoch.active_replicas.entrySet()
                         .stream()
                         .filter((_entry) -> _entry.getValue().equals(next))
@@ -829,6 +862,7 @@ public class Replica extends AbstractReplica {
                     tell(_msg, next);
                     scheduleElectionAckTimeout(next);
                 }
+                */
             }
 
             if(m_crash_request.isPresent() && Crash.Type.Election == m_crash_request.get().crash.type) {
