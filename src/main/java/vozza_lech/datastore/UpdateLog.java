@@ -1,5 +1,6 @@
 package vozza_lech.datastore;
 
+import akka.actor.Actor;
 import akka.actor.ActorRef;
 
 import java.io.Serializable;
@@ -11,11 +12,13 @@ public class UpdateLog {
         public final Update data;
         public final UpdateTimestamp timestamp;
         public final ActorRef initiator;
+        public final ActorRef client;
 
-        public UpdateInfo(Update _data, UpdateTimestamp _timestamp, ActorRef _initiator) {
+        public UpdateInfo(Update _data, UpdateTimestamp _timestamp, ActorRef _initiator, ActorRef _client) {
             this.data = _data;
             this.timestamp = _timestamp;
             this.initiator = _initiator;
+            this.client = _client;
         }
     }
 
@@ -40,7 +43,7 @@ public class UpdateLog {
      * Assumes strict in-order insertion
      * Returns false if _timestamp does not come after the last logged entry.
      */
-    public boolean addLog(Update _data, UpdateTimestamp _timestamp, ActorRef _initiator) {
+    public boolean addLog(Update _data, UpdateTimestamp _timestamp, ActorRef _initiator, ActorRef _client) {
         if (!m_log.isEmpty()) {
             var last_log = m_log.get(m_log.size() - 1);
             if (last_log.timestamp.compareTo(_timestamp) > 0) {
@@ -48,7 +51,7 @@ public class UpdateLog {
             }
         }
 
-        m_log.add(new UpdateInfo(_data, _timestamp, _initiator));
+        m_log.add(new UpdateInfo(_data, _timestamp, _initiator, _client));
         return true;
     }
 
@@ -57,7 +60,7 @@ public class UpdateLog {
      * already present. Used during synchronization, where updates may arrive out of order.
      * Returns false if there is already one with the same timestamp.
      */
-    public boolean addLogIfAbsent(Update _data, UpdateTimestamp _timestamp, ActorRef _initiator) {
+    public boolean addLogIfAbsent(Update _data, UpdateTimestamp _timestamp, ActorRef _initiator, ActorRef _client) {
         if (contains(_timestamp)) {
             return false;
         }
@@ -68,7 +71,7 @@ public class UpdateLog {
             insertIndex++;
         }
 
-        m_log.add(insertIndex, new UpdateInfo(_data, _timestamp, _initiator));
+        m_log.add(insertIndex, new UpdateInfo(_data, _timestamp, _initiator, _client));
         return true;
     }
 
