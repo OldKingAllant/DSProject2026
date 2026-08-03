@@ -580,6 +580,8 @@ public class Replica extends AbstractReplica {
         }
 
         // TODO (later, with crash handling): start a timeout here to detect a C that never sends WRITEOK after this UPDATE.
+        m_writeok_timeout.ifPresent(Cancellable::cancel);
+
         m_writeok_timeout = Optional.of(
                 getContext().getSystem()
                         .getScheduler()
@@ -627,6 +629,15 @@ public class Replica extends AbstractReplica {
 
             // Apply locally too (coordinator is also a replica) and reply to client
             applyUpdate(pending.getData(), pending.getTimestamp(), pending.getInitiator(), pending.getClient());
+
+            if(m_crash_request.isPresent() && Crash.Type.WriteOK == m_crash_request.get().crash.type) {
+                var crash_internal = m_crash_request.get();
+                crash_internal.curr_message_count++;
+                if(crash_internal.curr_message_count >= crash_internal.crash.after_n_messages_of_type) {
+                    onCrashInEffect();
+                    return; // skips m_broadcast_in_progress = false; tryStartNextBroadcast();
+                }
+            }
 
             m_broadcast_in_progress = false;
             tryStartNextBroadcast(); // start next write if any are queued
@@ -914,6 +925,7 @@ public class Replica extends AbstractReplica {
             m_in_election = true;
             m_curr_status = Status.ELECTION;
             m_skipped_in_ring = new java.util.HashSet<>();
+            m_skipped_in_ring.add(_msg.for_crashed_coordinator);
             callbackOnElectionStarted(m_curr_epoch.coordinator_id);
             scheduleElectionGlobalTimeout();
         }
