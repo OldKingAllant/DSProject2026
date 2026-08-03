@@ -271,6 +271,10 @@ public class Replica extends AbstractReplica {
         return Props.create(Replica.class, () -> new Replica(id, minLatency, maxLatency, coordinatorBeatInterval, Optional.ofNullable(listener)));
     }
 
+    /**
+     * Initializes epoch, coordinator, and position list from the system setup message.
+     * Starts the heartbeat sender if this replica is the coordinator, or the heartbeat receive timeout otherwise.
+     */
     @Override
     public void initSystem(InitSystem sysInit) {
         /// It should not be possible for the
@@ -318,6 +322,10 @@ public class Replica extends AbstractReplica {
         }
     }
 
+    /**
+     * Registers all message handlers for client requests, the update broadcast protocol,
+     * heartbeats, and the election/synchronization protocol.
+     */
     @Override
     public final Receive createReceive() {
         return createBaseReceiveBuilder()
@@ -346,6 +354,10 @@ public class Replica extends AbstractReplica {
 
     //region CRASH MANAGEMENT
 
+    /**
+     * Create the crash request: immediate if type is Now, otherwise deferred until
+     * the Nth message of the given type is processed.
+     */
     @Override
     public void crash(AbstractReplica.Crash how_to_crash) {
         if (Status.CRASHED == m_curr_status) {
@@ -373,6 +385,7 @@ public class Replica extends AbstractReplica {
 
     /**
      * Called when a crash truly takes effect
+     * Puts the replica in CRASHED state and cancels every pending scheduled timeout, so it stops reacting to and sending any further message.
      */
     public void onCrashInEffect() {
         // Cancel all events and mark this
@@ -400,6 +413,9 @@ public class Replica extends AbstractReplica {
 
     //region CLIENT REQUESTS
 
+    /**
+     * Answers a client READ immediately from local state, no coordination needed.
+     */
     public void onReadRequest(AbstractClient.ReadRequest _request) {
         if(Status.CRASHED == m_curr_status) {
             return;
@@ -413,6 +429,10 @@ public class Replica extends AbstractReplica {
         getSender().tell(result, getSelf());
     }
 
+    /**
+     * Entry point for a client WRITE. If this replica is the coordinator, enqueues the write
+     * and tries to start a broadcast; otherwise forwards it to the coordinator and starts a BroadcastTimeout.
+     */
     public void onWriteRequest(AbstractClient.WriteRequest _request) {
         if (Status.CRASHED == m_curr_status) {
             return;
@@ -482,6 +502,10 @@ public class Replica extends AbstractReplica {
         }
     }
 
+    /**
+     * Coordinator-only: receives a write forwarded by another replica and enqueues it
+     * for the next broadcast round.
+     */
     public void onQueuedWrite(QueuedWrite _write) {
         if(Status.CRASHED == m_curr_status) {
             return;
@@ -503,6 +527,11 @@ public class Replica extends AbstractReplica {
         }
     }
 
+    /**
+     * Dequeues the next pending write and starts a new UPDATE broadcast round,
+     * only if no other update is currently in flight (enforces total order).
+     * Satisfies Total Order property, only one update in flight per coordinator at a time.
+     */
     private void tryStartNextBroadcast() {
         // Only start a new broadcast if nothing is currently in flight
         if (m_broadcast_in_progress || m_write_queue.isEmpty()) {
@@ -532,6 +561,10 @@ public class Replica extends AbstractReplica {
 
     //region UPDATE BROADCAST
 
+    /**
+     * Cancels the current BroadcastTimeout and reschedules it for the next
+     * queued write request, if any (handles multiple pending writes correctly).
+     */
     public void removeBroadcastTimeout() {
         m_broadcast_timeout.ifPresent(Cancellable::cancel);
         m_broadcast_timeout = Optional.empty();
@@ -553,6 +586,11 @@ public class Replica extends AbstractReplica {
         }
     }
 
+    /**
+     * Replica-side handler for the coordinator's UPDATE broadcast: records the update as in-flight,
+     * replies with an ACK and starts a WriteOKTimeout to detect a coordinator crash mid-broadcast.
+     * Satisfies the two-phase update protocol (UPDATE/ACK, then WRITEOK)
+     */
     public void onUpdateMsg(UpdateMsg _msg) {
         if (Status.CRASHED == m_curr_status) {
             return;
@@ -595,6 +633,11 @@ public class Replica extends AbstractReplica {
         );
     }
 
+    /**
+     * Coordinator-side handler for ACKs: once a quorum is reached, logs the update, broadcasts WRITEOK, applies it locally
+     * and starts the next queued broadcast.
+     * Satisfies quorum size |Q| = floor(N/2)+1 (strict majority)
+     */
     public void onAckMsg(AckMsg _msg) {
         if (Status.CRASHED == m_curr_status) {
             return;
@@ -644,6 +687,10 @@ public class Replica extends AbstractReplica {
         }
     }
 
+    /**
+     * Replica-side handler for WRITEOK: clears in-flight/timeout state, logs the update and applies it locally.
+     * Satisfies the two-phase update protocol (UPDATE/ACK, then WRITEOK)
+     */
     public void onWriteOkMsg(WriteOkMsg _msg) {
         if (Status.CRASHED == m_curr_status) {
             return;
@@ -672,6 +719,12 @@ public class Replica extends AbstractReplica {
         }
     }
 
+    /**
+     * Applies a confirmed update to the local position list; if this replica is the initiator,
+     * also removes it from the pending queue and replies to the client with the WriteResult.
+     * Satisfies the integrity property, a client's write is completed (WriteResult sent) exactly once,
+     * on the replica that originally received it, regardless of which path completed the update.
+     */
     private void applyUpdate(Update _data, UpdateTimestamp _timestamp, ActorRef _initiator, ActorRef _client) {
         if(_initiator.equals(getSelf())) {
             // Message was propagated by us, remove
@@ -693,6 +746,9 @@ public class Replica extends AbstractReplica {
 
     //region HEARTBEAT
 
+    /**
+     * Coordinator-only periodic tick: sends a HEARTBEAT to every active replica and arms a per-replica timeout to detect silent replica failures.
+     */
     public void onRunHeartbeat(RunHeartbeat _beat) {
         if(m_curr_epoch.coordinator_id != id) {
             // Uhm... what?
@@ -734,6 +790,9 @@ public class Replica extends AbstractReplica {
                 });
     }
 
+    /**
+     * Coordinator-side: a replica failed to answer a heartbeat in time so it is removed from the active replicas set.
+     */
     public void onHeartbeatRequestTimeout(HeartbeatRequestTimeout _timeout) {
         if(m_curr_epoch.coordinator_id != id) {
             throw new IllegalActorStateException("Received heartbeat timeout not on coordinator");
@@ -746,6 +805,9 @@ public class Replica extends AbstractReplica {
         m_curr_epoch.active_replicas.remove(_timeout.replica_id);
     }
 
+    /**
+     * Coordinator-side: cancels the heartbeat timeout for a replica that just replied, confirms it is alive.
+     */
     public void onHeartbeatResponse(HeartbeatResponse _response) {
         if(Status.CRASHED == m_curr_status) {
             return;
@@ -767,6 +829,9 @@ public class Replica extends AbstractReplica {
         m_heartbeat_timeouts.remove(_response.replica_id);
     }
 
+    /**
+     * Non-coordinator: replies to the coordinator's heartbeat and renews the local coordinator-liveness timeout.
+     */
     public void onHeartbeatRequest(HeartbeatRequest _request) {
         if(Status.CRASHED == m_curr_status || Status.ELECTION == m_curr_status) {
             return;
@@ -805,6 +870,10 @@ public class Replica extends AbstractReplica {
         }
     }
 
+    /**
+     * Fires when no heartbeat arrived from the coordinator in time; starts a new election
+     * (detects a silent coordinator crash).
+     */
     public void onHeartbeatReceiveTimeout(HeartbeatReceiveTimeout _timeout) {
         if (Status.CRASHED == m_curr_status) return;
         debug(String.format("replica %d HEARTBEAT timeout", id));
@@ -817,6 +886,9 @@ public class Replica extends AbstractReplica {
 
     public static class ElectionGlobalTimeout implements Serializable {}
 
+    /**
+     * Begins a ring-based election: builds this replica's candidate entry and forwards it to the next reachable replica.
+     */
     private void startElection(int _crashedCoordinatorId) {
         if (m_in_election) {
             debug("already in election, ignoring startElection call");
@@ -853,6 +925,10 @@ public class Replica extends AbstractReplica {
 
     }
 
+    /**
+     * Election handler: ignores stale elections, elects the winner once the ring is complete
+     * or appends this replica's entry and forwards the message.
+     */
     public void onElectionMsg(ElectionMsg _msg){
         if (m_curr_status == Status.CRASHED) {
             return;
@@ -947,6 +1023,10 @@ public class Replica extends AbstractReplica {
         }
     }
 
+    /**
+     * Cancels the per-hop election ack timeout once the next replica in the ring
+     * confirms it received the forwarded election message.
+     */
     public void onElectionAckMsg(ElectionAckMsg _msg){
         if (m_curr_status == Status.CRASHED){
             return;
@@ -963,6 +1043,12 @@ public class Replica extends AbstractReplica {
         }
     }
 
+    /**
+     * Promotes this replica to coordinator for a new epoch: recovers any missing update,
+     * broadcasts a SYNCHRONIZATION message and resumes processing pending writes.
+     * Satisfies the safety property, an update acknowledged by a quorum before the crash
+     * is never lost, by re-propagating the in-flight or last-logged update via SYNCHRONIZATION.
+     */
     private void becomeCoordinator(){
         callbackOnCoordinatorElected(id);
 
@@ -1031,6 +1117,10 @@ public class Replica extends AbstractReplica {
         tryStartNextBroadcast(); // FIFO grants this arrives after syncMsg
     }
 
+    /**
+     * Non-coordinator: catches up on any missing update from the new coordinator,
+     * updates epoch/coordinator info, and forwards queued writes to the new coordinator.
+     */
     public void onSynchronizationMsg(SynchronizationMsg _msg){
         if (m_curr_status == Status.CRASHED){
             return;
@@ -1088,6 +1178,9 @@ public class Replica extends AbstractReplica {
         m_requested_updates.clear();
     }
 
+    /**
+     * Finds the next reachable replica in the logical ring, skipping any id marked as unreachable.
+     */
     private ActorRef computeNextInRing(Set<Integer> _skip) {
         var sortedIds = new ArrayList<>(m_curr_epoch.active_replicas.keySet());
         Collections.sort(sortedIds);
@@ -1108,10 +1201,18 @@ public class Replica extends AbstractReplica {
         return getSelf();
     }
 
+    /**
+     * Selects the election winner: the candidate with the most recent known update, break ties with replica id.
+     * Satisfies the guarantee that the elected coordinator will know the most recent update,
+     * since a majority (hence at least one correct replica with full knowledge) is always alive.
+     */
     private CandidateEntry pickWinner(List<CandidateEntry> _candidates) {
         return _candidates.stream().max(Comparator.comparing((CandidateEntry a) -> a.lastKnownUpdate).thenComparingInt(a -> a.replicaId)).orElseThrow();
     }
 
+    /**
+     * Builds this replica's own candidacy entry for an election, based on its most recent in-flight or logged update.
+     */
     private CandidateEntry buildMyEntry() {
         // First check if there is an incomplete update and use that
         // as the last known update, else use the last writeoked
@@ -1121,6 +1222,9 @@ public class Replica extends AbstractReplica {
         return new CandidateEntry(id, lastApplied);
     }
 
+    /**
+     * Fires when an election fails to complete in time; resets election state and restarts it.
+     */
     public void onElectionGlobalTimeout(ElectionGlobalTimeout _timeout) {
         if (Status.CRASHED == m_curr_status || Status.ELECTION != m_curr_status) {
             return;
@@ -1130,6 +1234,9 @@ public class Replica extends AbstractReplica {
         startElection(m_curr_epoch.coordinator_id);
     }
 
+    /**
+     * (Re)schedules the timeout for the ack of the election message just forwarded to the given target replica.
+     */
     private void scheduleElectionAckTimeout(ActorRef _target) {
         m_election_ack_timeout.ifPresent(Cancellable::cancel);
         // Extract the ID from active_replicas by reverse lookup
@@ -1148,6 +1255,9 @@ public class Replica extends AbstractReplica {
         );
     }
 
+    /**
+     * (Re)schedules the overall election-completion timeout, scaled by the number of replicas.
+     */
     private void scheduleElectionGlobalTimeout() {
         m_election_global_timeout.ifPresent(Cancellable::cancel);
         long delay = (long) getMaxLatencyPlusTolerance() * getSystemNumberOfActors();
@@ -1162,6 +1272,12 @@ public class Replica extends AbstractReplica {
         );
     }
 
+    /**
+     * The next replica in the ring failed to ack in time; skips it and retries
+     * with the next reachable candidate.
+     * Satisfies the election fault tolerance, the ring election completes even with
+     * multiple consecutive replica crashes, by skipping unresponsive nodes.
+     */
     public void onElectionAckTimeout(ElectionAckTimeout _timeout) {
         if (Status.CRASHED == m_curr_status || Status.ELECTION != m_curr_status) {
             return;
@@ -1176,12 +1292,22 @@ public class Replica extends AbstractReplica {
         scheduleElectionAckTimeout(next);
     }
 
+    /**
+     * Fires when a forwarded write never got a response from the coordinator; starts an election
+     * (coordinator crashed before starting the broadcast).
+     * Satisfies the crash detection mid-protocol, coordinator crash before starting the broadcast (Broadcast) or before completing it (WriteOK)
+     */
     public void onBroadcastTimeout(BroadcastTimeout _timeout) {
         if (Status.CRASHED == m_curr_status) return;
         debug(String.format("replica %d BROADCAST timeout", id));
         startElection(m_curr_epoch.coordinator_id);
     }
 
+    /**
+     * Fires when an ACK-ed UPDATE never got a WRITEOK in time; starts an election
+     * (coordinator crashed mid-broadcast).
+     * Satisfies the crash detection mid-protocol, coordinator crash before starting the broadcast (Broadcast) or before completing it (WriteOK)
+     */
     public void onWriteOKTimeout(WriteOKTimeout _timeout) {
         if (Status.CRASHED == m_curr_status) return;
         debug(String.format("replica %d WRITEOK timeout", id));
