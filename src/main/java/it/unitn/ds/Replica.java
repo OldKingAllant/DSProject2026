@@ -32,6 +32,7 @@ public class Replica extends AbstractReplica {
         m_recv_heartbeat_timeout = Optional.empty();
         m_broadcast_timeout = Optional.empty();
         m_writeok_timeout   = Optional.empty();
+        m_apply_timeouts = new HashMap<>();
     }
 
     @Override
@@ -153,6 +154,32 @@ public class Replica extends AbstractReplica {
 
     public static class WriteOKTimeout implements Serializable {}
 
+    public static class ApplyConfirmation implements Serializable {
+        public final UpdateTimestamp timestamp;
+        public final ActorRef initiator;
+        public final int initiator_id;
+
+        public ApplyConfirmation(UpdateTimestamp _timestamp, ActorRef _initiator, int _id) {
+            timestamp = _timestamp;
+            initiator = _initiator;
+            initiator_id = _id;
+        }
+    }
+
+    public static class ApplyTimeout implements Serializable {
+        public final UpdateTimestamp timestamp;
+        public final int initiator_id;
+        public final Update orig_update;
+        public final ActorRef client;
+
+        public ApplyTimeout(UpdateTimestamp _timestamp, int _initiator_id, Update _update, ActorRef _client) {
+            timestamp = _timestamp;
+            initiator_id = _initiator_id;
+            orig_update = _update;
+            client = _client;
+        }
+    }
+
     public static class CandidateEntry implements Serializable {
         public final int replicaId;
         public final UpdateTimestamp lastKnownUpdate;
@@ -238,6 +265,13 @@ public class Replica extends AbstractReplica {
     // The coordinator processes only one update at a time to preserve total order:
     // the next request is dequeued only after WRITEOK for the current one is sent.
     Queue<QueuedWrite> m_write_queue = new LinkedList<>();
+
+    // Maps update timestamp to a timeout event which is setup
+    // by the coordinator when sending a writeok to the update
+    // initiator. If the initiator does not respond,
+    // the coordinator itself will send confirmation
+    // to the client
+    Map<UpdateTimestamp, Cancellable> m_apply_timeouts;
 
     boolean m_broadcast_in_progress = false;
 
@@ -337,6 +371,8 @@ public class Replica extends AbstractReplica {
                 .match(WriteOkMsg.class, this::onWriteOkMsg)
                 .match(BroadcastTimeout.class, this::onBroadcastTimeout)
                 .match(WriteOKTimeout.class, this::onWriteOKTimeout)
+                .match(ApplyConfirmation.class, this::onApplyConfirmation)
+                .match(ApplyTimeout.class, this::onApplyConfirmationTimeout)
                 .match(RunHeartbeat.class, this::onRunHeartbeat)
                 .match(HeartbeatRequestTimeout.class, this::onHeartbeatRequestTimeout)
                 .match(HeartbeatResponse.class, this::onHeartbeatResponse)
@@ -407,6 +443,8 @@ public class Replica extends AbstractReplica {
         m_election_ack_timeout = Optional.empty();
         m_election_global_timeout.ifPresent(Cancellable::cancel);
         m_election_global_timeout = Optional.empty();
+        m_apply_timeouts.forEach((_timestamp, _event) -> _event.cancel());
+        m_apply_timeouts.clear();
     }
 
     //endregion
@@ -662,16 +700,45 @@ public class Replica extends AbstractReplica {
             debug(String.format("quorum reached for %d:%d, broadcasting WRITEOK",
                     _msg.timestamp.getEpoch(), _msg.timestamp.getSn()));
 
+            var initiator_id_ref = m_curr_epoch.active_replicas.entrySet()
+                            .stream()
+                            .filter((_id_ref) -> _id_ref.getValue().equals(pending.getInitiator()))
+                            .findFirst();
+
             m_curr_epoch.active_replicas.forEach((_id, _ref) -> {
                 if (_id == id) {
                     return;
                 }
+
                 tell(new WriteOkMsg(pending.getTimestamp(), pending.getData(), pending.getInitiator(),
                         pending.getClient()), _ref);
             });
 
             // Apply locally too (coordinator is also a replica) and reply to client
             applyUpdate(pending.getData(), pending.getTimestamp(), pending.getInitiator(), pending.getClient());
+
+            if(!pending.getInitiator().equals(getSelf())) {
+                // Initiator crashed sometime before the quorum was reached
+                // Send the confirmation to the client
+                if(initiator_id_ref.isEmpty()) {
+                    var result = new AbstractClient.WriteResult(true,
+                            pending.getData().getIndex(), pending.getData().getPosition(), id);
+                    pending.getClient().tell(result, getSelf());
+                } else {
+                    // Set up confirmation timeout
+                    m_apply_timeouts.put(_msg.timestamp,
+                            getContext().getSystem()
+                                    .getScheduler()
+                                    .scheduleOnce(
+                                            Duration.ofMillis(getMaxLatencyPlusTolerance()),
+                                            getSelf(),
+                                            new ApplyTimeout(_msg.timestamp, initiator_id_ref.get().getKey(), pending.getData(), pending.getClient()),
+                                            getContext().getDispatcher(),
+                                            getSelf()
+                                    )
+                    );
+                }
+            }
 
             if(m_crash_request.isPresent() && Crash.Type.WriteOK == m_crash_request.get().crash.type) {
                 var crash_internal = m_crash_request.get();
@@ -734,12 +801,47 @@ public class Replica extends AbstractReplica {
             var result = new AbstractClient.WriteResult(true,
                     _data.getIndex(), _data.getPosition(), id);
             _client.tell(result, getSelf());
+
+            if(m_curr_epoch.coordinator_id != id) {
+                getSender().tell(new ApplyConfirmation(_timestamp, getSelf(), id), getSelf());
+            }
         }
 
         m_position_list.updatePerson(_data.getIndex(), _data.getPosition(), _timestamp);
         callbackOnUpdateApplied(_data.getIndex(), _data.getPosition());
         log(String.format("applied update %d:%d (%d, %d)",
                 _timestamp.getEpoch(), _timestamp.getSn(), _data.getIndex(), _data.getPosition()));
+    }
+
+    public void onApplyConfirmation(ApplyConfirmation _confirm) {
+        if(Status.CRASHED == m_curr_status) {
+            return;
+        }
+
+        debug(String.format("update APPLY confirmed by initiator %d", _confirm.initiator_id));
+
+        if(!m_apply_timeouts.containsKey(_confirm.timestamp)) {
+            return;
+        }
+
+        m_apply_timeouts.remove(_confirm.timestamp).cancel();
+
+        // Nothing to do here
+    }
+
+    public void onApplyConfirmationTimeout(ApplyTimeout _timeout) {
+        if(Status.CRASHED == m_curr_status) {
+            return;
+        }
+
+        debug(String.format("update APPLY timeout for initiator %d", _timeout.initiator_id));
+        m_apply_timeouts.remove(_timeout.timestamp);
+        m_curr_epoch.active_replicas.remove(_timeout.initiator_id);
+
+        // Manually send confirmation to client
+        var result = new AbstractClient.WriteResult(true,
+                _timeout.orig_update.getIndex(), _timeout.orig_update.getPosition(), id);
+        _timeout.client.tell(result, getSelf());
     }
 
     //endregion
