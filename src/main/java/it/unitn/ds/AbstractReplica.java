@@ -86,7 +86,8 @@ public abstract class AbstractReplica extends AbstractActor {
      *         milliseconds
      */
     public int getMaxLatencyPlusTolerance() {
-        return maxLatency + (int)((float)maxLatency/2.0 * getSystemNumberOfActors());
+        //return maxLatency + (int)((float)maxLatency/2.0 * getSystemNumberOfActors()); //causes errors during test callbackOnUpdateAppliedOncePerWrite
+        return maxLatency + (int)((float)maxLatency * getSystemNumberOfActors());
     }
 
     // =================================================================================
