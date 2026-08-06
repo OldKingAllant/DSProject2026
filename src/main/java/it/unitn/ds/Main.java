@@ -231,7 +231,7 @@ public class Main {
         System.out.println("========================================\n");
     }
 
-    public static void main(String[] args) {
+    public static void main5(String[] args) {
         System.out.println("========================================");
         System.out.println("START");
         System.out.println("========================================\n");
@@ -281,6 +281,71 @@ public class Main {
 
             replicas.get(1).tell(new AbstractReplica.Crash(AbstractReplica.Crash.Type.Update, 1), ActorRef.noSender());
             client1.tell(new AbstractClient.WriteRequest(0, 10), ActorRef.noSender());
+
+            Thread.sleep(10000L);
+
+        } catch (InterruptedException ignored) {}
+
+        system.terminate();
+
+        System.out.println("\n========================================");
+        System.out.println("END");
+        System.out.println("========================================\n");
+    }
+
+    public static void main(String[] args) {
+        System.out.println("========================================");
+        System.out.println("START");
+        System.out.println("========================================\n");
+
+        final int N_REPLICAS = 3;
+        final int COORDINATOR_ID = 0;
+        final ActorSystem system = ActorSystem.create("TestMain");
+
+        Logger.setDestinationStdout();
+        Logger.setDebugEnabled(true);
+
+        Map<Integer, ActorRef> replicas = new HashMap<>(N_REPLICAS);
+        for (int i = 0; i < N_REPLICAS; i++) {
+            replicas.put(i,
+                    system.actorOf(
+                            Replica.props(i, AbstractReplica.MIN_LATENCY * 10, AbstractReplica.MAX_LATENCY * 10, AbstractReplica.COORDINATOR_BEAT_INTERVAL),
+                            "Replica_" + i
+                    )
+            );
+        }
+
+        InitSystem initMsg = new InitSystem(replicas, COORDINATOR_ID);
+        for (Map.Entry<Integer, ActorRef> entry : replicas.entrySet()) {
+            entry.getValue().tell(initMsg, ActorRef.noSender());
+        }
+
+        // TODO: Create your clients
+
+        // TODO: Implement your main logic
+
+        try {
+            // --- Create clients ---
+            ActorRef client0 = system.actorOf(
+                    Client.props(1000, 5000, Optional.of(replicas.get(0))),
+                    "Client_0"
+            );
+            ActorRef client1 = system.actorOf(
+                    Client.props(1000, 5000, Optional.of(replicas.get(1))),
+                    "Client_1"
+            );
+            ActorRef client2 = system.actorOf(
+                    Client.props(1000, 5000, Optional.of(replicas.get(2))),
+                    "Client_2"
+            );
+
+            // --- Scenario ---
+
+            replicas.get(0).tell(new AbstractReplica.Crash(AbstractReplica.Crash.Type.Update, 2), ActorRef.noSender());
+            client1.tell(new AbstractClient.WriteRequest(0, 10), ActorRef.noSender());
+            client2.tell(new AbstractClient.WriteRequest(0, 20), ActorRef.noSender());
+            client2.tell(new AbstractClient.WriteRequest(0, 25), ActorRef.noSender());
+            client1.tell(new AbstractClient.WriteRequest(0, 30), ActorRef.noSender());
 
             Thread.sleep(10000L);
 

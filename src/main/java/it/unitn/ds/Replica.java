@@ -603,13 +603,13 @@ public class Replica extends AbstractReplica {
      * Cancels the current BroadcastTimeout and reschedules it for the next
      * queued write request, if any (handles multiple pending writes correctly).
      */
-    public void removeBroadcastTimeout() {
+    public void removeBroadcastTimeout(boolean _schedule_new_timeout) {
         m_broadcast_timeout.ifPresent(Cancellable::cancel);
         m_broadcast_timeout = Optional.empty();
 
         var next_update = m_requested_updates.stream().skip(1).findFirst();
 
-        if(next_update.isPresent()) {
+        if(_schedule_new_timeout && next_update.isPresent()) {
             m_broadcast_timeout = Optional.of(
                     getContext().getSystem()
                             .getScheduler()
@@ -636,7 +636,12 @@ public class Replica extends AbstractReplica {
 
         m_in_flight_update = Optional.of(new Pair<>(_msg.timestamp, _msg));
 
-        removeBroadcastTimeout();
+        // Do not schedule a new broadcast timeout,
+        // since this update still has to complete,
+        // and the new broadcast might go in timeout
+        // before completion (also if other replicas
+        // request updates in the meantime)
+        removeBroadcastTimeout(false);
 
         debug(String.format("received UPDATE %d:%d (%d, %d)",
                 _msg.timestamp.getEpoch(), _msg.timestamp.getSn(),
@@ -655,9 +660,7 @@ public class Replica extends AbstractReplica {
             }
         }
 
-        // TODO (later, with crash handling): start a timeout here to detect a C that never sends WRITEOK after this UPDATE.
         m_writeok_timeout.ifPresent(Cancellable::cancel);
-
         m_writeok_timeout = Optional.of(
                 getContext().getSystem()
                         .getScheduler()
@@ -765,7 +768,7 @@ public class Replica extends AbstractReplica {
 
         m_in_flight_update = Optional.empty();
 
-        removeBroadcastTimeout();
+        removeBroadcastTimeout(true);
 
         m_writeok_timeout.ifPresent(Cancellable::cancel);
         m_writeok_timeout = Optional.empty();
@@ -988,6 +991,17 @@ public class Replica extends AbstractReplica {
 
     public static class ElectionGlobalTimeout implements Serializable {}
 
+    private void removeTimeoutsForElection() {
+        m_recv_heartbeat_timeout.ifPresent(Cancellable::cancel);
+        m_recv_heartbeat_timeout = Optional.empty();
+
+        m_broadcast_timeout.ifPresent(Cancellable::cancel);
+        m_broadcast_timeout = Optional.empty();
+
+        m_writeok_timeout.ifPresent(Cancellable::cancel);
+        m_writeok_timeout = Optional.empty();
+    }
+
     /**
      * Begins a ring-based election: builds this replica's candidate entry and forwards it to the next reachable replica.
      */
@@ -1002,8 +1016,7 @@ public class Replica extends AbstractReplica {
         m_skipped_in_ring = new java.util.HashSet<>();
         m_skipped_in_ring.add(_crashedCoordinatorId);
 
-        m_recv_heartbeat_timeout.ifPresent(Cancellable::cancel);
-        m_recv_heartbeat_timeout = Optional.empty();
+        removeTimeoutsForElection();
 
         callbackOnElectionStarted(_crashedCoordinatorId);
 
@@ -1045,6 +1058,8 @@ public class Replica extends AbstractReplica {
             // The only important thing is that the new coordinator should receive
             // the complete election list. The following replicas have no need
             // to do that, only to sync with the coordinator
+            debug(String.format("replica %d received a stale ELECTION message",id));
+
             if(m_crash_request.isPresent() && Crash.Type.Election == m_crash_request.get().crash.type) {
                 var crash_internal = m_crash_request.get();
                 crash_internal.curr_message_count++;
@@ -1053,6 +1068,15 @@ public class Replica extends AbstractReplica {
                 }
             }
 
+            return;
+        }
+
+        if(m_curr_epoch.coordinator_id == id) {
+            debug(String.format("coordinator %d received an ELECTION message",id));
+            // This should never happen. But now that we are here we cannot simply
+            // drop the message, otherwise the previous nodes in the ring will go
+            // in timeout.
+            becomeCoordinator();
             return;
         }
 
@@ -1068,24 +1092,6 @@ public class Replica extends AbstractReplica {
                 m_last_election_msg = Optional.of(_msg);
                 tell(_msg, next);
                 scheduleElectionAckTimeout(next);
-
-                /*
-                Not ok, in case of more than two replicas active
-                in the ring, the new coordinator might
-                not receive the complete election
-
-                var next_id = m_curr_epoch.active_replicas.entrySet()
-                        .stream()
-                        .filter((_entry) -> _entry.getValue().equals(next))
-                        .map(Map.Entry::getKey)
-                        .findFirst();
-
-                if(next_id.isEmpty() || next_id.get() != winner.replicaId) {
-                    m_last_election_msg = Optional.of(_msg);
-                    tell(_msg, next);
-                    scheduleElectionAckTimeout(next);
-                }
-                */
             }
 
             if(m_crash_request.isPresent() && Crash.Type.Election == m_crash_request.get().crash.type) {
@@ -1104,6 +1110,9 @@ public class Replica extends AbstractReplica {
             m_curr_status = Status.ELECTION;
             m_skipped_in_ring = new java.util.HashSet<>();
             m_skipped_in_ring.add(_msg.for_crashed_coordinator);
+
+            removeTimeoutsForElection();
+
             callbackOnElectionStarted(m_curr_epoch.coordinator_id);
             scheduleElectionGlobalTimeout();
         }
@@ -1197,6 +1206,7 @@ public class Replica extends AbstractReplica {
         m_in_election = false;
         m_curr_status = Status.IDLE;
 
+        m_pending_heartbeat.ifPresent(Cancellable::cancel);
         m_pending_heartbeat = Optional.of(
                 getContext().getSystem().getScheduler().scheduleAtFixedRate(
                         Duration.ofMillis(getCoordinatorBeatInterval()),
