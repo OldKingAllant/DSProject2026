@@ -709,13 +709,25 @@ public class Replica extends AbstractReplica {
                             .findFirst();
 
             m_curr_epoch.active_replicas.forEach((_id, _ref) -> {
-                if (_id == id) {
+                if (_id == id || Status.CRASHED == m_curr_status) {
                     return;
                 }
 
                 tell(new WriteOkMsg(pending.getTimestamp(), pending.getData(), pending.getInitiator(),
                         pending.getClient()), _ref);
+
+                if(m_crash_request.isPresent() && Crash.Type.WriteOK == m_crash_request.get().crash.type) {
+                    var crash_internal = m_crash_request.get();
+                    crash_internal.curr_message_count++;
+                    if(crash_internal.curr_message_count >= crash_internal.crash.after_n_messages_of_type) {
+                        onCrashInEffect();
+                    }
+                }
             });
+
+            if(Status.CRASHED == m_curr_status) {
+                return;
+            }
 
             // Apply locally too (coordinator is also a replica) and reply to client
             applyUpdate(pending.getData(), pending.getTimestamp(), pending.getInitiator(), pending.getClient());
@@ -740,15 +752,6 @@ public class Replica extends AbstractReplica {
                                             getSelf()
                                     )
                     );
-                }
-            }
-
-            if(m_crash_request.isPresent() && Crash.Type.WriteOK == m_crash_request.get().crash.type) {
-                var crash_internal = m_crash_request.get();
-                crash_internal.curr_message_count++;
-                if(crash_internal.curr_message_count >= crash_internal.crash.after_n_messages_of_type) {
-                    onCrashInEffect();
-                    return; // skips m_broadcast_in_progress = false; tryStartNextBroadcast();
                 }
             }
 
