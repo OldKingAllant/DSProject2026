@@ -519,7 +519,7 @@ public class Replica extends AbstractReplica {
                         getContext().getSystem()
                                 .getScheduler()
                                 .scheduleOnce(
-                                        Duration.ofMillis(getMaxLatencyPlusTolerance()),
+                                        Duration.ofMillis(getMaxLatencyPlusTolerance() * 2),
                                         getSelf(),
                                         new BroadcastTimeout(),
                                         getContext().getDispatcher(),
@@ -614,7 +614,7 @@ public class Replica extends AbstractReplica {
                     getContext().getSystem()
                             .getScheduler()
                             .scheduleOnce(
-                                    Duration.ofMillis(getMaxLatencyPlusTolerance()),
+                                    Duration.ofMillis(getMaxLatencyPlusTolerance() * 2),
                                     getSelf(),
                                     new BroadcastTimeout(),
                                     getContext().getDispatcher(),
@@ -665,7 +665,7 @@ public class Replica extends AbstractReplica {
                 getContext().getSystem()
                         .getScheduler()
                         .scheduleOnce(
-                                Duration.ofMillis(getMaxLatencyPlusTolerance()),
+                                Duration.ofMillis(getMaxLatencyPlusTolerance() * 2),
                                 getSelf(),
                                 new WriteOKTimeout(),
                                 getContext().getDispatcher(),
