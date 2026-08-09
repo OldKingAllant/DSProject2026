@@ -1,7 +1,7 @@
 package it.unitn.ds;
 
 import akka.actor.*;
-import scala.Int;
+
 import vozza_lech.datastore.PersonOfInterest;
 import vozza_lech.datastore.PositionList;
 import vozza_lech.datastore.UpdateLog;
