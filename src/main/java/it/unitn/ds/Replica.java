@@ -1239,6 +1239,8 @@ public class Replica extends AbstractReplica {
         for(var update : m_requested_updates) {
             onQueuedWrite(update);
         }
+        // Here we can clear the queue, since if we crash,
+        // those updates would be lost anyway (we are the initiator)
         m_requested_updates.clear();
 
         tryStartNextBroadcast(); // FIFO grants this arrives after syncMsg
@@ -1304,7 +1306,9 @@ public class Replica extends AbstractReplica {
         for(var update : m_requested_updates) {
             coordinator_ref.tell(update, getSelf());
         }
-        m_requested_updates.clear();
+        // Do not clear the queue, new coordinator might crash,
+        // losing the requested updates
+        // m_requested_updates.clear();
     }
 
     /**
