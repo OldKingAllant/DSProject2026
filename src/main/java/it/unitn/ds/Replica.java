@@ -1,6 +1,7 @@
 package it.unitn.ds;
 
 import akka.actor.*;
+import scala.Int;
 import vozza_lech.datastore.PersonOfInterest;
 import vozza_lech.datastore.PositionList;
 import vozza_lech.datastore.UpdateLog;
@@ -276,9 +277,10 @@ public class Replica extends AbstractReplica {
     boolean m_broadcast_in_progress = false;
 
     boolean m_in_election = false;
-    Optional<Cancellable> m_election_ack_timeout = Optional.empty();
+    Optional<Cancellable> m_election_ack_timeout    = Optional.empty();
     Optional<Cancellable> m_election_global_timeout = Optional.empty();
-    Optional<ElectionMsg> m_last_election_msg = Optional.empty();
+    Optional<ElectionMsg> m_last_election_msg       = Optional.empty();
+    Optional<Integer> m_possible_winner             = Optional.empty();
 
     public record Pair<K, V>(K key, V value)
     {
@@ -1053,7 +1055,9 @@ public class Replica extends AbstractReplica {
         }
         tell(new ElectionAckMsg(id), getSender());
 
-        if(_msg.for_crashed_coordinator != m_curr_epoch.coordinator_id) {
+        boolean cond_1 = (m_possible_winner.isPresent() && m_possible_winner.get() != _msg.for_crashed_coordinator);
+        boolean cond_2 = (m_possible_winner.isEmpty() && _msg.for_crashed_coordinator != m_curr_epoch.coordinator_id);
+        if(cond_1 || cond_2) {
             // Coordinator was already elected,
             // avoid circulating the same election
             // indefinitely
@@ -1061,7 +1065,12 @@ public class Replica extends AbstractReplica {
             // The only important thing is that the new coordinator should receive
             // the complete election list. The following replicas have no need
             // to do that, only to sync with the coordinator
-            debug(String.format("replica %d received a stale ELECTION message",id));
+            if (cond_1) {
+                debug(String.format("replica %d received a stale ELECTION message (new election)",id));
+            } else {
+                debug(String.format("replica %d received a stale ELECTION message (old election)",id));
+            }
+
 
             if(m_crash_request.isPresent() && Crash.Type.Election == m_crash_request.get().crash.type) {
                 var crash_internal = m_crash_request.get();
@@ -1086,6 +1095,7 @@ public class Replica extends AbstractReplica {
         boolean hasMyEntry = _msg.candidates.stream().anyMatch(c -> c.replicaId == id);
         if (hasMyEntry) {
             var winner = pickWinner(_msg.candidates);
+            m_possible_winner = Optional.of(winner.replicaId);
             debug(String.format("ELECTION complete, winner is %d", winner.replicaId));
 
             if (winner.replicaId == id){
@@ -1170,6 +1180,8 @@ public class Replica extends AbstractReplica {
         m_curr_epoch.coordinator_id = id;
         m_next_sn = 0;
 
+        m_possible_winner = Optional.empty();
+
         UpdateLog.UpdateInfo missingUpdate = null;
         if (m_in_flight_update.isPresent()) { // Check if update in flight
             // That update cannot have been applied, no writeok
@@ -1249,6 +1261,8 @@ public class Replica extends AbstractReplica {
 
         m_curr_epoch.coordinator_id = _msg.newCoordinatorId;
         m_curr_epoch.id = _msg.newEpoch;
+
+        m_possible_winner = Optional.empty();
 
         // If any update was in flight, it for sure
         // has been applied through the sync message
@@ -1345,8 +1359,9 @@ public class Replica extends AbstractReplica {
             return;
         }
         debug(String.format("replica %d ELECTION timeout", id));
+        var old_coordinator_id = m_possible_winner.orElse(m_curr_epoch.coordinator_id);
         m_in_election = false;
-        startElection(m_curr_epoch.coordinator_id);
+        startElection(old_coordinator_id);
     }
 
     /**

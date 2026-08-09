@@ -146,6 +146,8 @@ class ElectionCrashTest {
         client.tell(new AbstractClient.WriteRequest(
                 TestsCommons.TEST_INDEX, TestsCommons.TEST_VALUE), Actor.noSender());
 
+        Thread.sleep(TestsCommons.getElectionMaxDelay(sys));
+
         long window = TestsCommons.getElectionMaxDelay(sys) * 2
                 + TestsCommons.TEST_COORDINATOR_BEAT_INTERVAL
                 + TestsCommons.getMaxUpdateDelay(sys);
@@ -178,9 +180,9 @@ class ElectionCrashTest {
                 "multiReplicaCrash_" + n_nodes, n_nodes, COORDINATOR_ID);
 
         sys.actors.get(CRASHING_REPLICA_ID_1).tell(
-                new Crash(Crash.Type.Election, 1), Actor.noSender());
+                new Crash(Crash.Type.Now, 1), Actor.noSender());
         sys.actors.get(CRASHING_REPLICA_ID_2).tell(
-                new Crash(Crash.Type.Election, 1), Actor.noSender());
+                new Crash(Crash.Type.Now, 1), Actor.noSender());
 
         sys.actors.get(COORDINATOR_ID).tell(new Crash(Crash.Type.Now, 0), Actor.noSender());
 
