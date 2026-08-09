@@ -478,11 +478,13 @@ public class Replica extends AbstractReplica {
             return;
         }
 
-        _request.replica = getSelf();
+        // *** _request.replica = getSelf();
+        var request = new AbstractClient.WriteRequest(_request.index, _request.value, getSelf());
 
         if (id == m_curr_epoch.coordinator_id) {
             // Enqueue and try to start broadcast (starts immediately if nothing in flight)
-            m_write_queue.add(new QueuedWrite(_request, getSender()));
+            // *** m_write_queue.add(new QueuedWrite(_request, getSender()));
+            m_write_queue.add(new QueuedWrite(request, getSender()));
             tryStartNextBroadcast();
 
             if(m_crash_request.isPresent() && Crash.Type.Update == m_crash_request.get().crash.type) {
@@ -493,7 +495,8 @@ public class Replica extends AbstractReplica {
                 }
             }
         } else {
-            var queued_write = new QueuedWrite(_request, getSender());
+            // *** var queued_write = new QueuedWrite(_request, getSender());
+            var queued_write = new QueuedWrite(request, getSender());
 
             // Can simply put them in the queue because:
             // messages are removed from the queue
