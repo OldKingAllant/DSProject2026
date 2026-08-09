@@ -196,7 +196,7 @@ public class Replica extends AbstractReplica {
         public final int old_epoch_id;
 
         public ElectionMsg(List<CandidateEntry> _candidates, int _crashed_coord, int _old_epoch) {
-            candidates = _candidates;
+            candidates = List.copyOf(_candidates);
             for_crashed_coordinator = _crashed_coord;
             old_epoch_id = _old_epoch;
         }
