@@ -466,7 +466,7 @@ public class Replica extends AbstractReplica {
                 maybe_person.orElse(new PersonOfInterest(new UpdateTimestamp(), 0)).position,
                 id);
 
-        getSender().tell(result, getSelf());
+        tell(result, getSender());
     }
 
     /**
@@ -517,6 +517,7 @@ public class Replica extends AbstractReplica {
             if(Status.ELECTION != m_curr_status) {
                 // Not the coordinator: just forward the request along.
                 var coordinator_ref = m_curr_epoch.active_replicas.get(m_curr_epoch.coordinator_id);
+                // tell(queued_write, coordinator_ref); not possible, WriteRequest not serializable
                 coordinator_ref.tell(queued_write, getSelf());
 
                 m_broadcast_timeout.ifPresent(Cancellable::cancel);
@@ -743,7 +744,7 @@ public class Replica extends AbstractReplica {
                 if(initiator_id_ref.isEmpty()) {
                     var result = new AbstractClient.WriteResult(true,
                             pending.getData().getIndex(), pending.getData().getPosition(), id);
-                    pending.getClient().tell(result, getSelf());
+                    tell(result, pending.getClient());
                 } else {
                     // Set up confirmation timeout
                     m_apply_timeouts.put(_msg.timestamp,
@@ -811,10 +812,10 @@ public class Replica extends AbstractReplica {
 
             var result = new AbstractClient.WriteResult(true,
                     _data.getIndex(), _data.getPosition(), id);
-            _client.tell(result, getSelf());
+            tell(result, _client);
 
             if(m_curr_epoch.coordinator_id != id) {
-                getSender().tell(new ApplyConfirmation(_timestamp, getSelf(), id), getSelf());
+                tell(new ApplyConfirmation(_timestamp, getSelf(), id), getSender());
             }
         }
 
@@ -852,7 +853,8 @@ public class Replica extends AbstractReplica {
         // Manually send confirmation to client
         var result = new AbstractClient.WriteResult(true,
                 _timeout.orig_update.getIndex(), _timeout.orig_update.getPosition(), id);
-        _timeout.client.tell(result, getSelf());
+
+        tell(result, _timeout.client);
     }
 
     //endregion
@@ -879,12 +881,13 @@ public class Replica extends AbstractReplica {
                     }
 
                     // Send heartbeat and schedule timeout
-                    _ref.tell(new HeartbeatRequest(getSelf()), getSelf());
+                    tell(new HeartbeatRequest(getSelf()), _ref);
+
                     m_heartbeat_timeouts.put(_id,
                             getContext().getSystem()
                                     .getScheduler()
                                     .scheduleOnce(
-                                            Duration.ofMillis(getMaxLatency() * 2L),
+                                            Duration.ofMillis(getMaxLatencyPlusTolerance() * 2L),
                                             getSelf(),
                                             new HeartbeatRequestTimeout(_ref, _id),
                                             getContext().getDispatcher(),
@@ -955,7 +958,7 @@ public class Replica extends AbstractReplica {
         }
 
         var response = new HeartbeatResponse(getSelf(), id);
-        getSender().tell(response, getSelf());
+        tell(response, getSender());
 
         // Remove coordinator crash failure detection and put
         // a renewed one in its place
@@ -1307,6 +1310,7 @@ public class Replica extends AbstractReplica {
         // Forward all halted updates to the new coordinator
         var coordinator_ref = m_curr_epoch.active_replicas.get(m_curr_epoch.coordinator_id);
         for(var update : m_requested_updates) {
+            // tell(update, coordinator_ref); Not possible since WriteRequest is not serializable
             coordinator_ref.tell(update, getSelf());
         }
         // Do not clear the queue, new coordinator might crash,
