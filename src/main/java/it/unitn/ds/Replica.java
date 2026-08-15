@@ -1313,6 +1313,22 @@ public class Replica extends AbstractReplica {
             // tell(update, coordinator_ref); Not possible since WriteRequest is not serializable
             coordinator_ref.tell(update, getSelf());
         }
+        if(!m_requested_updates.isEmpty()) {
+            m_broadcast_timeout.ifPresent(Cancellable::cancel); // This isn't necessary, since at this point in time
+                                                                // no broadcast timeout should exist, but we leave it here
+                                                                // anyway
+            m_broadcast_timeout = Optional.of(
+                    getContext().getSystem()
+                            .getScheduler()
+                            .scheduleOnce(
+                                    Duration.ofMillis(getMaxLatencyPlusTolerance() * 2),
+                                    getSelf(),
+                                    new BroadcastTimeout(),
+                                    getContext().getDispatcher(),
+                                    getSelf()
+                            )
+            );
+        }
         // Do not clear the queue, new coordinator might crash,
         // losing the requested updates
         // m_requested_updates.clear();
