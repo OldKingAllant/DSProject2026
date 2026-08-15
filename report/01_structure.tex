@@ -1,0 +1,91 @@
+\section{Project Structure}
+
+%Definisci gli Actors: Replica, Client e altri che possono essere utili dopo
+%Tabella/lista dei message types, potremmo separali per fase (oppure no, dipende dallo spazio che abbiamo)
+
+\subsection{Actors}
+
+The system is implemented as a set of Akka actors, all deriving from the abstract base classes
+\texttt{AbstractReplica} and \texttt{AbstractClient} provided by the codebase, which expose the
+mandatory API callbacks and the crash/initialization message handling shared by every node. All
+protocol state (position list, update log, epoch info, pending timeouts) lives inside a single
+\texttt{Replica} actor instance and is never exposed by reference outside it; every message crossing an actor boundary
+carries only immutable data. As a result, no thread-level synchronization primitive is ever required within a single replica, a property of the actor
+model, not specific to our design. 
+%This is unrelated to \emph{distributed} synchronization between replicas, which is instead achieved explicitly through the update and election protocols.
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Replica}: implements a full storage node, running the three protocols (update broadcast, heartbeat-based failure detection, ring election) as
+  message handlers over its own private state. Concentrating all three protocols in a single actor
+  class avoids introducing extra inter-actor
+  coordination for state that all three protocols must read consistently, such as the current epoch
+  and coordinator id.
+
+  \item \textbf{Client}: issues \texttt{ReadRequest}/\texttt{WriteRequest} messages to a replica and
+  tracks each outstanding request together with its own timeout, invoking the corresponding callback
+  when a result, or a timeout, is received. Requests are tracked individually so a slow read never blocks an unrelated write to a different index.
+
+  \item \textbf{NetworkChannel}: a per-destination actor, transparently instantiated by the
+  \texttt{tell()} helper in \texttt{AbstractReplica}, that injects a random delay between
+  \texttt{minLatency} and \texttt{maxLatency} before forwarding a message to its real recipient. One
+  channel is created per (sender, destination) pair specifically so FIFO ordering is preserved between
+  any two actors.
+
+\end{itemize}
+
+\subsection{How Updates Are Stored}
+
+Every accepted update is uniquely identified by an \texttt{UpdateTimestamp}, the $\langle e,i
+\rangle$ pair (epoch, sequence number) that also defines the total order between updates via
+\texttt{compareTo}. Three data structures build on this identifier to track an update through its
+lifecycle:
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{PendingUpdate}: created by the coordinator when a broadcast round starts. It bundles
+  the update data, its timestamp, the client to reply to, and the set of replica ids that have ACKed
+  it so far, so quorum can be checked with a simple size comparison instead of re-scanning messages.
+  \item \textbf{UpdateLog}: the durable, per-replica history of \emph{completed} updates. Entries are
+  appended in strict timestamp order (\texttt{addLog}) once a \texttt{WriteOkMsg} is processed; this
+  is also what lets a newly elected coordinator determine "the most recent update it knows of" during
+  the election. During synchronization, out-of-order insertion (\texttt{addLogIfAbsent}) is used
+  instead, since a recovered update may need to be inserted before entries a replica already applied.
+  \item \textbf{PositionList} / \textbf{PersonOfInterest}: the actual application state (the array of
+  positions), where each entry additionally remembers the timestamp of the update that last wrote it.
+  This is only ever touched by \texttt{applyUpdate()}, after an update has already been safely logged.
+\end{itemize}
+
+Keeping "in-progress" state (\texttt{PendingUpdate}) and "completed" state (\texttt{UpdateLog}) in
+two distinct structures makes it straightforward, during recovery, to tell whether an interrupted
+update was merely broadcast or already confirmed by a quorum.
+
+\subsection{Message Flow}
+
+\begin{center}
+\small
+\begin{tabular}{|C{2.8cm}|C{9.3cm}|}
+\hline
+\textbf{Phase} & \textbf{Purpose} \\
+\hline
+Client $\leftrightarrow$ Replica &
+  Clients issue reads (answered immediately from local state) and writes (forwarded to the
+  coordinator if needed); timeouts on the client side detect an unresponsive replica. \\
+\hline
+Update broadcast &
+  Implements the two-phase \texttt{UPDATE}/\texttt{ACK}/\texttt{WRITEOK} exchange coordinated by the
+  coordinator, plus the timeouts used to detect a coordinator crash mid-round. \\
+\hline
+Heartbeat &
+  Periodic coordinator-to-replica liveness check, used both to let replicas detect a silently
+  crashed coordinator and to let the coordinator remove unresponsive replicas. \\
+\hline
+Coordinator election &
+  Ring-based election of a new coordinator after a crash is detected, followed by a synchronization
+  phase. \\
+\hline
+Setup / test instrumentation &
+  System initialization (\texttt{InitSystem}), crash injection (\texttt{Crash}), and the
+  observability callbacks (\texttt{CoordinatorElected}, \texttt{UpdateApplied},
+  \texttt{ElectionStarted}) for the automated test suite.\\
+\hline
+\end{tabular}
+\end{center}
