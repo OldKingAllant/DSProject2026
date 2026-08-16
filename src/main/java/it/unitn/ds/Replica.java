@@ -479,11 +479,15 @@ public class Replica extends AbstractReplica {
         }
 
         // *** _request.replica = getSelf();
+        // Build a new WriteRequest instead of mutating the received one in place: Akka delivers
+        // local messages by reference, so mutating _request would corrupt state still held by the
+        // sending Client actor (violates actor encapsulation / no shared mutable state).
         var request = new AbstractClient.WriteRequest(_request.index, _request.value, getSelf());
 
         if (id == m_curr_epoch.coordinator_id) {
             // Enqueue and try to start broadcast (starts immediately if nothing in flight)
             // *** m_write_queue.add(new QueuedWrite(_request, getSender()));
+            // Use the new "request" object (with replica set) instead of the original _request.
             m_write_queue.add(new QueuedWrite(request, getSender()));
             tryStartNextBroadcast();
 
