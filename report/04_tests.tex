@@ -1,0 +1,23 @@
+\section{Tests}
+
+The project includes automated tests to verify the correctness of the implementation, some provided by the base repo (from now on referred to as "base tests") and some additional tests that put the system under more stress in specific conditions.
+
+\subsection{Base tests}
+
+There are three tests modules:
+\begin{itemize}
+    \item API compliance tests (verify that the implementation follows API rules)
+    \item NoCrashes: to verify that the system respected sequential consistency for writes, when a client always accesses the same replica
+    \item WithCrashes: verify that writes complete also if some replicas are in a crashed state
+\end{itemize}
+
+However, the provided tests are incomplete, since they neither test for crash scenario during the update process, nor during an election.
+
+\subsection{Additional tests}
+
+\begin{itemize}
+    \item CoordinatorBroadcasCrashTest: Verify that (one or more) writes complete successfully even if the coordinator crashes before/in the middle of broadcasting one of them. Writes may come either from one or multiple replicas. Also tests for a non-coordinator crash during the broadcast protocol
+    \item CoordinatorWriteOKCrashTest: Similar to above, but during WriteOK
+    \item ElectionCrashTest: Tests crashes during the election protocol, verifies that crashed replicas in the ring are skipped correctly, multiple elections one after the other and, finally, election timeouts (triggers a new election during the old election)
+    \item InitiatorCrashTest: Verify that if the initiator of an update crashes before sending confirmation to the client, the coordinator will do it
+\end{itemize}

@@ -1,1 +1,52 @@
 \section{Implementation}
+
+\subsection{Additionally on timeouts and crashes}
+
+Broadcast timeouts are managed in a different way with respect to the others, since they are the only type of timeout where the associated event on the update initiator (e.g. the update being broadcast) can be in conflict with updates coming from other replicas or even previous updates from the replica itself. For this reason, broadcast timeouts are canceled when either forwarding a WriteRequest (if a timeout is already present) or any update is received from the coordinator, while being rescheduled on update forwarding or after a WriteOK message (if any update is in the local m\_requested\_updates queue).
+
+If a crash was requested, the target replica keeps the original crash request and, if the request did not take effect immediately, it also keeps a counter for the number of associated messages that were processed. When the counter reaches the threshold, the replica truly "crashes", so it stop responding to messages and all timeouts are canceled. Crash instrumentation has been put in as many places as possible without cluttering the implementation
+
+\subsection{Stale or incomplete election detection}
+
+During an election, if the algorithm reaches the point where a node knows the id of the new coordinator, said id is put in a variable "m\_possible\_winner", which is used together with the id of the crashed coordinator for which the current election has been started to detect stale election messages under the following two conditions. 
+
+\begin{lstlisting}
+boolean cond_1 = (m_possible_winner.isPresent() &&
+m_possible_winner.get() != _msg.for_crashed_coordinator);
+boolean cond_2 = (m_possible_winner.isEmpty() &&
+_msg.for_crashed_coordinator != m_curr_epoch.coordinator_id);
+\end{lstlisting}
+
+For the former indicates that the last election did not complete because the winner crashed before initiating a new epoch, while the latter tells that the message comes from an election that has already been completed. In any case, stale election messages are simply ignored.
+
+Since "m\_possible\_winner" is cleared only when an election truly ends, if it is set to an id, it clearly flags the existence of an election which has never reached completion.
+
+Moreover, a timeout (called m\_election\_global\_timeout) is scheduled when an election is started, warning the system that an election has been going on for too long and cannot complete, which then triggers a new election. Depending on whether the winner was already found or not, the new election will carry the winner id or still contain the old coordinator id (respectively).
+
+\subsection{Stalled write requests}
+
+All replicas, when they received a WriteRequest from a client, before doing anything else, put said request in a queue (m\_requested\_updates). Since only one update at a time is processed by the system (and each WriteOK carries the id of the initiator), the first, and only the first, update request can be removed from the queue, when the initiator applies the update locally in applyUpdate. 
+
+Write requests are also put in the queue when the system is performing an election, therefore there is currently no coordinator to which they can be forwarded. 
+
+With this method, even if a coordinator crashes while multiple clients have sent multiple updates, those updates are not lost, because after the election, each replica can conveniently forward all updates in its queue to the new coordinator. In case the replica and the new coordinator coincide, updates in the local queue are immediately enqueued for broadcast (so they take priority over updates from other replicas).
+
+\subsection{Write confirmation}
+\label{sec:write-confirmation}
+
+The system makes sure that if either the initiator of an update or the coordinator crash (not both), the client which sent the WriteRequest still receives the confirmation that the write succeeded. First of all, each update message, also the logs, keep information about both the initiator and the client. 
+For the coordinator crash case, when applying the update (either WriteOK or synchronization with a new coordinator) it is enough for the initiator to verify that the update was started by it by looking at the initiator field in the message; if the initiator was truly itself, it can send confirmation to the client (also in the message). For the initiator crash case, it is a little more complicated (the following are done by the coordinator):
+\begin{enumerate}
+    \item When sending a WriteOK, (if we aren't the initiator) check if the update initiator is considered still active or not
+    (look in m\_curr\_epoch.active\_replicas), if not send the confirmation immediately to the client, else set up a ApplyTimeout
+    \item Since the update is now considered complete, multiple ApplyTimeout may exist at any given time, their handles are put in an HashMap with the update timestamp as key
+    \item If the initiator applies the update and sends confirmation to the client, it will also send a ApplyConfirmation to the coordinator, the update process is truly complete. Otherwise
+    \item The ApplyConfirmation is not received in time, the coordinator will use the client found in the timeout information to directly send confirmation to the client
+\end{enumerate}
+
+\subsection{Regarding synchronization}
+
+No explicit application-level ACK is used for \texttt{SynchronizationMsg}: FIFO delivery
+combined with the fact that an actor processes one message at a time already guarantees every
+replica handles it in order relative to any other message from the same sender, so an
+acknowledgement would add no further guarantee.

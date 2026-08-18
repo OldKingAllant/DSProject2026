@@ -22,6 +22,8 @@
 \usepackage{algorithm2e}
 \usepackage[edges]{forest}
 
+\newcolumntype{C}[1]{>{\centering\arraybackslash}m{#1}}
+
 % VS2017 C++ color scheme
 \definecolor{clr-background}{RGB}{255,255,255}
 \definecolor{clr-text}{RGB}{0,0,0}
@@ -90,13 +92,6 @@
     \input{01_structure}
     \input{02_design}
     \input{03_implementation}
-
-    \begin{center}
-        \Large\color{red}
-        DO NOT change the template margins or font size.
-
-        Feel free to include all \LaTeX packages you need and customize their settings.
-
-        The provided sections are examples and can be changed.
-    \end{center}
+    \input{04_tests}
+    \input{05_LLM}
 \end{document}

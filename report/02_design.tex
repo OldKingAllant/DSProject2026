@@ -1,1 +1,134 @@
 \section{System Design}
+\label{sec:design}
+
+\subsection{Update Protocol}
+
+Write requests are always funneled through the current coordinator. A non-coordinator replica
+receiving a \texttt{WriteRequest} enqueues it locally (\texttt{m\_requested\_updates}, for later recovery) and forwards it to the coordinator; the coordinator enqueues every incoming write in
+\texttt{m\_write\_queue} and processes it through \texttt{tryStartNextBroadcast()}, which starts a
+new round only if no other update is currently in flight
+(\texttt{m\_broadcast\_in\_progress}).
+
+Each round assigns the write a timestamp $\langle e,i\rangle$ (current epoch, monotonically
+increasing sequence number reset at every new epoch) and runs the classic two-phase protocol:
+
+\begin{enumerate}[leftmargin=*]
+  \item The coordinator broadcasts \texttt{UpdateMsg}$\langle e,i\rangle$ to all active replicas.
+  \item Each replica stores the update as in-flight, replies with \texttt{AckMsg}, and arms a
+  \texttt{WriteOKTimeout} to detect a coordinator crash mid-broadcast.
+  \item Once the coordinator collects acknowledgements from a quorum
+  $|Q| = \lfloor N/2 \rfloor + 1$ (itself included), it appends the update to its log and broadcasts
+  \texttt{WriteOkMsg}.
+  \item On \texttt{WriteOkMsg}, every non-coordinator replica appends the update to its own log
+  and applies it to \texttt{PositionList}, replying to the client if it was the original request
+  recipient. The coordinator does the same immediately after the broadcast loop, without going
+  through \texttt{onWriteOkMsg} itself, since it never sends the message to itself.
+\end{enumerate}
+
+When the initiator of a write is not the coordinator, the coordinator additionally waits for an
+\texttt{ApplyConfirmation} from it after sending \texttt{WriteOkMsg}, guarded by an
+\texttt{ApplyTimeout}. This covers the case where the initiator crashes after the update was applied
+by a quorum but before it manages to reply to the client: if the confirmation never arrives, the
+coordinator sends the \texttt{WriteResult} to the client itself once the timeout fires.
+
+\subsection{Reliable Broadcast Properties}
+
+\begin{center}
+\small
+\begin{tabular}{|C{2.8cm}|C{13cm}|}
+\hline
+\textbf{Property} & \textbf{How it is satisfied} \\
+\hline
+Validity & A quorum of correct replicas is always available (system assumption), so the coordinator always eventually collects a quorum of ACKs and completes the
+broadcast for any write issued by a correct client. \\
+\hline
+Integrity & Every update carries a unique $\langle e,i\rangle$ timestamp and is only ever applied
+after being received via \texttt{WriteOkMsg} or \texttt{SynchronizationMsg}. The coordinator's single-broadcast-at-a-time implmentation together
+with FIFO channels prevents duplicate delivery; during recovery, \texttt{UpdateLog.addLogIfAbsent}
+explicitly guards against re-applying an update a replica already has. \\
+\hline
+Uniform Agreement & If the coordinator crashes after a quorum acknowledged an update but before every
+replica received \texttt{WriteOkMsg}, the newly elected coordinator re-derives that update (from its
+own in-flight state or its log) and re-disseminates it via \texttt{SynchronizationMsg} before serving
+new writes, so all correct replicas converge to the same log. \\
+\hline
+Total Order & The coordinator keeps at most one update in flight at a time
+(\texttt{m\_broadcast\_in\_progress}), assigning strictly increasing $\langle e,i\rangle$ timestamps
+one round at a time; combined with FIFO channels, this guarantees every replica receives
+\texttt{WriteOkMsg} messages in the same order they were generated. \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{Sequential Consistency}
+
+Channels are assumed reliable and FIFO, and \texttt{NetworkChannel} preserves this property between
+any ordered pair of actors even with random delays. Clients are allowed to pipeline several requests
+without waiting for a reply (\texttt{Client} tracks a list of outstanding reads and writes, not a
+single one), so sequential consistency cannot rely on client-side blocking. It instead follows
+directly from FIFO delivery combined with the fact that an actor processes its mailbox one message at
+a time: requests from a given client to a given replica arrive, and are therefore handled, in the
+exact order they were sent. Read requests are answered immediately from local state in that order,
+while write requests are additionally serialized by the coordinator into a single totally-ordered
+log, so any two clients reading the same index observe mutually consistent values.
+
+\subsection{Crash Detection}
+
+Three complementary timeouts detect coordinator failures at different protocol stages:
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{BroadcastTimeout}: armed by a replica after forwarding a write to the coordinator; it
+  fires if the coordinator never starts the corresponding \texttt{UpdateMsg} broadcast.
+  \item \textbf{WriteOKTimeout}: armed by a replica after acknowledging an \texttt{UpdateMsg}; it
+  fires if the corresponding \texttt{WriteOkMsg} never arrives (coordinator crashed mid-broadcast).
+  \item \textbf{HeartbeatReceiveTimeout}: armed by every non-coordinator replica and renewed on every
+  received \texttt{HeartbeatRequest}; it fires when the coordinator is silently unreachable even with
+  no pending write.
+  \item 
+  \textbf{ElectionGlobalTimeout}: armed when an election starts; it fires if the election does
+  not complete in time (e.g.\ a ring participant or the winning candidate crashes mid-election),
+  restarting the election from \texttt{m\_possible\_winner} if a winner was already identified, or
+  from the old crashed coordinator otherwise.
+\end{itemize}
+
+Symmetrically, the coordinator uses per-replica \texttt{HeartbeatRequestTimeout}s to detect and evict
+silently crashed replicas from its local \texttt{active\_replicas} map.
+
+\subsection{Coordinator Election}
+
+The ring is defined by sorting replica ids. When a coordinator crash is detected, election proceeds as follows:
+
+\begin{enumerate}[leftmargin=*]
+  \item The detecting replica enters \texttt{ELECTION} status and sends an \texttt{ElectionMsg}
+  carrying a list of \texttt{CandidateEntry}$\langle$replicaId, lastKnownUpdate$\rangle$ to the next
+  reachable replica in the ring.
+  \item Each hop is acknowledged with \texttt{ElectionAckMsg} and guarded by
+  \texttt{ElectionAckTimeout}: if a hop times out, the sender marks that replica as skipped
+  (\texttt{m\_skipped\_in\_ring}) and forwards to the next one, so the election tolerates multiple
+  consecutive crashes.
+  \item A replica that sees its own id already in the candidate list has seen the full ring. It
+  determines the winner as the candidate with the most recent $\langle e,i\rangle$, ties broken by
+  highest id (\texttt{pickWinner}). Since a majority of replicas is always alive, at least one
+  candidate is guaranteed to know the latest update.
+  \item The winner promotes itself via \texttt{becomeCoordinator()}, starts a new epoch, and
+  broadcasts \texttt{SynchronizationMsg} carrying any update that may not have reached every
+  replica; other nodes adopt the new coordinator and epoch upon receiving it.
+\end{enumerate}
+
+Election completion is protected by \texttt{ElectionGlobalTimeout} (Section~\ref{sec:design},
+Crash Detection). Separately, stale \texttt{ElectionMsg}s referring to an already-resolved election
+are detected and dropped via the \texttt{m\_possible\_winner} bookkeeping, preventing the same
+election from circulating indefinitely.
+
+\subsection{Additional Assumptions}
+
+\begin{itemize}[leftmargin=*]
+  \item Heartbeats are implemented as request/response rather than a plain broadcast, so the
+coordinator can also detect and evict silently crashed replicas, not just be detected by them.
+\item Uniform Agreement guarantees an update is applied by every correct replica, but not that the
+client is notified. The \texttt{ApplyConfirmation}/\texttt{ApplyTimeout} mechanism (Section~\ref{sec:write-confirmation}) covers this when
+the initiator differs from the coordinator; the one gap left is the coordinator crashing between
+reaching quorum and applying the update to itself while also being the initiator, where the client
+may time out despite the write succeeding system-wide. Confirmed with the teaching assistants as
+non-mandatory to handle since a full fix would require changes to classes shared with the provided tests.
+\end{itemize}
