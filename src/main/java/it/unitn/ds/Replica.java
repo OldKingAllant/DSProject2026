@@ -315,7 +315,6 @@ public class Replica extends AbstractReplica {
     public void initSystem(InitSystem sysInit) {
         /// It should not be possible for the
         /// replica to be crashed here
-        //TODO check that this is ok
         //m_curr_epoch.active_replicas = Map.copyOf(sysInit.group);
         m_curr_epoch.active_replicas = new HashMap<>(sysInit.group);
 
@@ -403,7 +402,6 @@ public class Replica extends AbstractReplica {
             return;
         }
 
-        // TODO: Verify this is ok
         if(m_crash_request.isPresent()) {
             throw new IllegalActorStateException("Crash requested even though a crash request already exists");
         }
@@ -939,7 +937,6 @@ public class Replica extends AbstractReplica {
 
         if(!m_heartbeat_timeouts.containsKey(_response.replica_id)) {
             debug(String.format("received late heartbeat RESPONSE from %d", _response.replica_id));
-            // TODO: Should we reinsert the replica in the active list?
             return;
         }
 

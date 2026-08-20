@@ -37,10 +37,6 @@ public class Main {
             entry.getValue().tell(initMsg, ActorRef.noSender());
         }
 
-        // TODO: Create your clients
-        
-        // TODO: Implement your main logic
-
         try {
             // --- Create clients ---
             ActorRef client0 = system.actorOf(
@@ -135,10 +131,6 @@ public class Main {
             entry.getValue().tell(initMsg, ActorRef.noSender());
         }
 
-        // TODO: Create your clients
-
-        // TODO: Implement your main logic
-
         try {
             // --- Create clients ---
             ActorRef client0 = system.actorOf(
@@ -195,10 +187,6 @@ public class Main {
         for (Map.Entry<Integer, ActorRef> entry : replicas.entrySet()) {
             entry.getValue().tell(initMsg, ActorRef.noSender());
         }
-
-        // TODO: Create your clients
-
-        // TODO: Implement your main logic
 
         try {
             // --- Create clients ---
@@ -258,10 +246,6 @@ public class Main {
             entry.getValue().tell(initMsg, ActorRef.noSender());
         }
 
-        // TODO: Create your clients
-
-        // TODO: Implement your main logic
-
         try {
             // --- Create clients ---
             ActorRef client0 = system.actorOf(
@@ -319,10 +303,6 @@ public class Main {
         for (Map.Entry<Integer, ActorRef> entry : replicas.entrySet()) {
             entry.getValue().tell(initMsg, ActorRef.noSender());
         }
-
-        // TODO: Create your clients
-
-        // TODO: Implement your main logic
 
         try {
             // --- Create clients ---
