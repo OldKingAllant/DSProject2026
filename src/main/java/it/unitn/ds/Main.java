@@ -10,9 +10,15 @@ import it.unitn.ds.AbstractReplica.InitSystem;
 
 public class Main {
 
+    /**
+     * Write via coordinator, write via a non-coordinator,
+     * then two concurrent writes to the same index from
+     * different clients to verify total ordering.
+     * @param args
+     */
     public static void main2(String[] args) {
         System.out.println("========================================");
-        System.out.println("START");
+        System.out.println("START main 2");
         System.out.println("========================================\n");
 
         final int N_REPLICAS = 3;
@@ -106,7 +112,7 @@ public class Main {
      */
     public static void main3(String[] args) {
         System.out.println("========================================");
-        System.out.println("START");
+        System.out.println("START main 3");
         System.out.println("========================================\n");
 
         final int N_REPLICAS = 3;
@@ -161,9 +167,14 @@ public class Main {
         System.out.println("========================================\n");
     }
 
+    /**
+     * Test coordinator crash during an in-flight UPDATE,
+     * with a single write in flight.
+     * @param args
+     */
     public static void main4(String[] args) {
         System.out.println("========================================");
-        System.out.println("START");
+        System.out.println("START main 4");
         System.out.println("========================================\n");
 
         final int N_REPLICAS = 3;
@@ -219,9 +230,13 @@ public class Main {
         System.out.println("========================================\n");
     }
 
+    /**
+     * Test crash of a non-coordinator replica during an in-flight UPDATE.
+     * @param args
+     */
     public static void main5(String[] args) {
         System.out.println("========================================");
-        System.out.println("START");
+        System.out.println("START main 5");
         System.out.println("========================================\n");
 
         final int N_REPLICAS = 3;
@@ -277,9 +292,14 @@ public class Main {
         System.out.println("========================================\n");
     }
 
+    /**
+     * Coordinator crashes mid-UPDATE while four concurrent
+     * writes from two different clients are in flight to the same index.
+     * @param args
+     */
     public static void main(String[] args) {
         System.out.println("========================================");
-        System.out.println("START");
+        System.out.println("START main");
         System.out.println("========================================\n");
 
         final int N_REPLICAS = 3;
@@ -336,5 +356,12 @@ public class Main {
         System.out.println("\n========================================");
         System.out.println("END");
         System.out.println("========================================\n");
+
+        /*
+        main2(args);
+        main3(args);
+        main4(args);
+        main5(args);
+        */
     }
 }
