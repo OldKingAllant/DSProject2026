@@ -10,6 +10,8 @@ import it.unitn.ds.AbstractReplica.InitSystem;
 
 public class Main {
 
+    private static final boolean DEBUG_ENABLED = false;
+
     /**
      * Write via coordinator, write via a non-coordinator,
      * then two concurrent writes to the same index from
@@ -19,6 +21,9 @@ public class Main {
     public static void main2(String[] args) {
         System.out.println("========================================");
         System.out.println("START main 2");
+        System.out.println("Write via coordinator, write via a non-coordinator, \n" +
+                "then two concurrent writes to the same index from\n" +
+                "different clients to verify total ordering.");
         System.out.println("========================================\n");
 
         final int N_REPLICAS = 3;
@@ -26,7 +31,7 @@ public class Main {
         final ActorSystem system = ActorSystem.create("TestMain");
 
         Logger.setDestinationStdout();
-        Logger.setDebugEnabled(true);
+        Logger.setDebugEnabled(DEBUG_ENABLED);
 
         Map<Integer, ActorRef> replicas = new HashMap<>(N_REPLICAS);
         for (int i = 0; i < N_REPLICAS; i++) {
@@ -107,12 +112,13 @@ public class Main {
 
     /**
      * Test "cold" crash of the coordinator
-     * (when no operation is being performed)
+     * (when no operation is being performed).
      * @param args
      */
     public static void main3(String[] args) {
         System.out.println("========================================");
         System.out.println("START main 3");
+        System.out.println("Test \"cold\" crash of the coordinator (when no operation is being performed).");
         System.out.println("========================================\n");
 
         final int N_REPLICAS = 3;
@@ -120,7 +126,7 @@ public class Main {
         final ActorSystem system = ActorSystem.create("TestMain");
 
         Logger.setDestinationStdout();
-        Logger.setDebugEnabled(true);
+        Logger.setDebugEnabled(DEBUG_ENABLED);
 
         Map<Integer, ActorRef> replicas = new HashMap<>(N_REPLICAS);
         for (int i = 0; i < N_REPLICAS; i++) {
@@ -175,6 +181,7 @@ public class Main {
     public static void main4(String[] args) {
         System.out.println("========================================");
         System.out.println("START main 4");
+        System.out.println("Test coordinator crash during an in-flight UPDATE with a single write in flight.");
         System.out.println("========================================\n");
 
         final int N_REPLICAS = 3;
@@ -182,7 +189,7 @@ public class Main {
         final ActorSystem system = ActorSystem.create("TestMain");
 
         Logger.setDestinationStdout();
-        Logger.setDebugEnabled(true);
+        Logger.setDebugEnabled(DEBUG_ENABLED);
 
         Map<Integer, ActorRef> replicas = new HashMap<>(N_REPLICAS);
         for (int i = 0; i < N_REPLICAS; i++) {
@@ -237,6 +244,7 @@ public class Main {
     public static void main5(String[] args) {
         System.out.println("========================================");
         System.out.println("START main 5");
+        System.out.println("Test crash of a non-coordinator replica during an in-flight UPDATE.");
         System.out.println("========================================\n");
 
         final int N_REPLICAS = 3;
@@ -244,7 +252,7 @@ public class Main {
         final ActorSystem system = ActorSystem.create("TestMain");
 
         Logger.setDestinationStdout();
-        Logger.setDebugEnabled(true);
+        Logger.setDebugEnabled(DEBUG_ENABLED);
 
         Map<Integer, ActorRef> replicas = new HashMap<>(N_REPLICAS);
         for (int i = 0; i < N_REPLICAS; i++) {
@@ -300,6 +308,8 @@ public class Main {
     public static void main(String[] args) {
         System.out.println("========================================");
         System.out.println("START main");
+        System.out.println("Coordinator crashes mid-UPDATE while four concurrent writes \n" +
+                "from two different clients are in flight to the same index.");
         System.out.println("========================================\n");
 
         final int N_REPLICAS = 3;
@@ -307,7 +317,7 @@ public class Main {
         final ActorSystem system = ActorSystem.create("TestMain");
 
         Logger.setDestinationStdout();
-        Logger.setDebugEnabled(true);
+        Logger.setDebugEnabled(DEBUG_ENABLED);
 
         Map<Integer, ActorRef> replicas = new HashMap<>(N_REPLICAS);
         for (int i = 0; i < N_REPLICAS; i++) {
@@ -357,11 +367,11 @@ public class Main {
         System.out.println("END");
         System.out.println("========================================\n");
 
-        /*
+
         main2(args);
         main3(args);
         main4(args);
         main5(args);
-        */
+
     }
 }

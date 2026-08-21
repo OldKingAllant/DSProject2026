@@ -421,7 +421,8 @@ public class Replica extends AbstractReplica {
 
     /**
      * Called when a crash truly takes effect
-     * Puts the replica in CRASHED state and cancels every pending scheduled timeout, so it stops reacting to and sending any further message.
+     * Puts the replica in CRASHED state and cancels every pending scheduled timeout,
+     * so it stops reacting to and sending any further message.
      */
     public void onCrashInEffect() {
         // Cancel all events and mark this
@@ -864,7 +865,8 @@ public class Replica extends AbstractReplica {
     //region HEARTBEAT
 
     /**
-     * Coordinator-only periodic tick: sends a HEARTBEAT to every active replica and arms a per-replica timeout to detect silent replica failures.
+     * Coordinator-only periodic tick: sends a HEARTBEAT to every active replica and
+     * arms a per-replica timeout to detect silent replica failures.
      */
     public void onRunHeartbeat(RunHeartbeat _beat) {
         if(m_curr_epoch.coordinator_id != id) {
