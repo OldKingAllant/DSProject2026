@@ -40,7 +40,7 @@ class CoordinatorWriteOKCrashTest {
                         Optional.of(sys.actors.get(targetReplicaID)), probe.getRef()),
                 "client");
 
-        // Program coordinator to crash after sending its 1st WRITEOK
+        // Coordinator crashes after sending its 1st WRITEOK
         sys.actors.get(COORDINATOR_ID).tell(
                 new Crash(Crash.Type.WriteOK, 1), Actor.noSender());
 
@@ -85,8 +85,7 @@ class CoordinatorWriteOKCrashTest {
                         Optional.of(sys.actors.get(targetReplicaID)), probe.getRef()),
                 "client");
 
-        // Crash after sending N-2 WRITEOKs (coordinator itself + N-2 others = N-1 total,
-        // so the last replica in the ring misses it)
+        // Crash after sending N-2 WRITEOKs (coordinator itself + N-2 others = N-1 total)
         int crashAfter = n_nodes - 2;
         sys.actors.get(COORDINATOR_ID).tell(
                 new Crash(Crash.Type.WriteOK, crashAfter), Actor.noSender());
@@ -142,7 +141,7 @@ class CoordinatorWriteOKCrashTest {
                 Client.propsWithListener(sys.client_read_timeout, sys.client_write_timeout,
                         Optional.of(sys.actors.get(n_nodes - 1)), readProbe.getRef()), "readClient");
 
-        // Program coordinator to crash after 1st WRITEOK
+        // Coordinator will crash after 1st WRITEOK
         sys.actors.get(COORDINATOR_ID).tell(
                 new Crash(Crash.Type.WriteOK, 1), Actor.noSender());
 
@@ -154,7 +153,7 @@ class CoordinatorWriteOKCrashTest {
 
         long window = TestsCommons.getElectionMaxDelay(sys) + TestsCommons.getMaxUpdateDelay(sys) * 2;
 
-        // Both writes must eventually complete (order not guaranteed between the two)
+        // Both writes must eventually complete
         WriteResult wr1 = (WriteResult) probe1.fishForMessage(
                 Duration.ofMillis(window), "WriteResult1", msg -> msg instanceof WriteResult);
         WriteResult wr2 = (WriteResult) probe2.fishForMessage(
@@ -167,7 +166,6 @@ class CoordinatorWriteOKCrashTest {
         Thread.sleep(TestsCommons.getMaxUpdateDelay(sys));
 
         // Final read must return the value of whichever write was committed last
-        // (both are to the same index, so the last one wins)
         readClient.tell(new AbstractClient.ReadRequest(TestsCommons.TEST_INDEX), Actor.noSender());
         ReadResult rr = (ReadResult) readProbe.fishForMessage(
                 Duration.ofMillis(TestsCommons.getLatencyPlusEpsilon(sys)),
@@ -204,11 +202,11 @@ class CoordinatorWriteOKCrashTest {
                         Optional.of(sys.actors.get(targetReplicaID)), probe.getRef()),
                 "client");
 
-        // Program coordinator to crash after 1st WRITEOK
+        // Coordinator will crash after 1st WRITEOK
         sys.actors.get(COORDINATOR_ID).tell(
                 new Crash(Crash.Type.WriteOK, 1), Actor.noSender());
 
-        // Send all writes rapidly (client is stateful, so each goes out immediately)
+        // Send all writes rapidly
         for (int v = 0; v < NUM_WRITES; v++) {
             client.tell(new AbstractClient.WriteRequest(TestsCommons.TEST_INDEX, v), Actor.noSender());
         }
@@ -216,7 +214,7 @@ class CoordinatorWriteOKCrashTest {
         long window = TestsCommons.getElectionMaxDelay(sys)
                 + TestsCommons.getMaxUpdateDelay(sys) * NUM_WRITES;
 
-        // All writes must complete (possibly after one election)
+        // All writes must complete
         for (int v = 0; v < NUM_WRITES; v++) {
             WriteResult wr = (WriteResult) probe.fishForMessage(
                     Duration.ofMillis(window), "WriteResult_" + v, msg -> msg instanceof WriteResult);

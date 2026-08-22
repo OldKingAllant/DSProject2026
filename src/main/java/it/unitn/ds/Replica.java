@@ -1355,7 +1355,7 @@ public class Replica extends AbstractReplica {
         }
 
         // Should never happen since majority is alive
-        // But a test case makes this happen :(
+        // But a test case makes this happen
         // throw new IllegalActorStateException("No reachable replica in ring");
         return getSelf();
     }
@@ -1374,8 +1374,7 @@ public class Replica extends AbstractReplica {
      */
     private CandidateEntry buildMyEntry() {
         // First check if there is an incomplete update and use that
-        // as the last known update, else use the last writeoked
-        // update
+        // as the last known update, else use the last writeoked update
         UpdateTimestamp lastApplied = m_in_flight_update.map(Pair::key).orElse(m_updates.getLastLogTimestamp()
                 .orElse(new UpdateTimestamp(0, 0)));
         return new CandidateEntry(id, lastApplied);
